@@ -4,12 +4,12 @@
 import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useStudio } from '../studioStore';
-import { COLOR_ORDER, COLOR_LABELS, PALETTES, formatLabel } from '../lib/core';
+import { COLOR_ORDER, COLOR_LABELS, PALETTES, formatLabel, nodeSize } from '../lib/core';
 import type { PaletteColor, ProjectTransition } from '../lib/core';
 import {
   findFlowNode, layoutFlowGraph, makeFlowNode, nid, updateFlowNode, toggleSubInDoc,
 } from '../lib/studio';
-import type { FlowKind, WbShape } from '../lib/studio';
+import type { FlowKind, FlowNode, WbShape } from '../lib/studio';
 import { BkIcon, BI, BOARD_COLORS, NEUTRAL_STROKES } from '../lib/boardkit';
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
@@ -50,7 +50,7 @@ function ToolBtn({ icon, label, active, onClick, title, dragTool }: {
 
 /* ================= 左侧面板 ================= */
 
-export function LeftPanel() {
+export function LeftPanel({ open = true, onToggle }: { open?: boolean; onToggle?: () => void } = {}) {
   const app = useStudio();
   const { page, tool, setTool, updatePage, requestFit, toast } = app;
 
@@ -89,9 +89,30 @@ export function LeftPanel() {
     toast('流程图已重新排布');
   };
 
+  if (!open) {
+    return (
+      <div className="w-[30px] flex-none flex flex-col items-center pt-2"
+        style={{ background: 'var(--panel)', borderRight: '1px solid var(--border)' }}>
+        <button onClick={onToggle} title="展开工具箱" aria-label="展开工具箱"
+          className="w-6 h-6 rounded-md flex items-center justify-center transition-colors hover:bg-[var(--panel-2)]"
+          style={{ color: 'var(--muted)' }}>
+          <BkIcon d={BI.chevR} size={14} />
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="w-[188px] flex-none flex flex-col overflow-y-auto"
       style={{ background: 'var(--panel)', borderRight: '1px solid var(--border)' }}>
+      <div className="flex items-center justify-between px-3.5 pt-2.5 pb-0.5">
+        <span className="text-[10.5px] font-bold tracking-wider" style={{ color: 'var(--muted)' }}>工具箱</span>
+        <button onClick={onToggle} title="收纳工具箱" aria-label="收纳工具箱"
+          className="w-5 h-5 rounded flex items-center justify-center transition-colors hover:bg-[var(--panel-2)]"
+          style={{ color: 'var(--muted)' }}>
+          <BkIcon d="M15 6l-6 6 6 6" size={12} />
+        </button>
+      </div>
       {page.type === 'canvas' ? (
         <>
           <Section title="状态机">
@@ -176,11 +197,14 @@ function ToggleRow({ label, on, onChange }: { label: string; on: boolean; onChan
 
 /* ================= 右侧属性面板 ================= */
 
-export function Inspector() {
+export function Inspector({ open = true, onToggle }: { open?: boolean; onToggle?: () => void } = {}) {
   const app = useStudio();
   const { sel, page, theme } = app;
 
   const body = useMemo(() => {
+    if ((sel.kind === 'state' || sel.kind === 'flow' || sel.kind === 'wb') && sel.ids.length > 1) {
+      return <MultiSelInspector />;
+    }
     if (sel.kind === 'state' && sel.id) {
       const s = page.states.find((x) => x.id === sel.id);
       return s ? <StateInspector id={s.id} /> : null;
@@ -211,9 +235,163 @@ export function Inspector() {
     // eslint-disable-next-line
   }, [sel, page, theme]);
 
+  if (!open) {
+    return (
+      <div className="w-[30px] flex-none flex flex-col items-center pt-2"
+        style={{ background: 'var(--panel)', borderLeft: '1px solid var(--border)' }}>
+        <button onClick={onToggle} title="展开属性面板" aria-label="展开属性面板"
+          className="w-6 h-6 rounded-md flex items-center justify-center transition-colors hover:bg-[var(--panel-2)]"
+          style={{ color: 'var(--muted)' }}>
+          <BkIcon d="M15 6l-6 6 6 6" size={14} />
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="w-[236px] flex-none overflow-y-auto" style={{ background: 'var(--panel)', borderLeft: '1px solid var(--border)' }}>
+      <div className="flex items-center justify-end px-2 pt-2">
+        <button onClick={onToggle} title="收纳属性面板" aria-label="收纳属性面板"
+          className="w-5 h-5 rounded flex items-center justify-center transition-colors hover:bg-[var(--panel-2)]"
+          style={{ color: 'var(--muted)' }}>
+          <BkIcon d={BI.chevR} size={12} />
+        </button>
+      </div>
       {body}
+    </div>
+  );
+}
+
+/* ================= 多选：对齐 / 分布 / 批量删除 ================= */
+
+const AL: Record<string, string> = {
+  left: 'M5 4v16M9 7h9v3H9zM9 14h6v3H9z',
+  hcenter: 'M12 4v16M7 7h10v3H7zM9 14h6v3H9z',
+  right: 'M19 4v16M6 7h9v3H6zM9 14h6v3H9z',
+  top: 'M4 5h16M7 9h3v9H7zM14 9h3v5h-3z',
+  vcenter: 'M4 12h16M7 7h3v10H7zM14 9h3v6h-3z',
+  bottom: 'M4 19h16M7 6h3v9H7zM14 10h3v5h-3z',
+  distH: 'M4 4v16M20 4v16M10 9h4v6h-4z',
+  distV: 'M4 4h16M4 20h16M9 10h6v4H9z',
+};
+
+type AlItem = { id: string; x: number; y: number; w: number; h: number };
+
+function distH(items: AlItem[]): Map<string, { x: number; y: number }> {
+  const sorted = [...items].sort((a, b) => a.x - b.x);
+  const res = new Map<string, { x: number; y: number }>();
+  if (sorted.length < 3) { sorted.forEach((i) => res.set(i.id, { x: i.x, y: i.y })); return res; }
+  const first = sorted[0], last = sorted[sorted.length - 1];
+  const inner = sorted.slice(1, -1);
+  const gap = (last.x - (first.x + first.w) - inner.reduce((a, i) => a + i.w, 0)) / (inner.length + 1);
+  let cursor = first.x + first.w + gap;
+  res.set(first.id, { x: first.x, y: first.y });
+  res.set(last.id, { x: last.x, y: last.y });
+  for (const i of inner) { res.set(i.id, { x: Math.round(cursor), y: i.y }); cursor += i.w + gap; }
+  return res;
+}
+
+function distV(items: AlItem[]): Map<string, { x: number; y: number }> {
+  const sorted = [...items].sort((a, b) => a.y - b.y);
+  const res = new Map<string, { x: number; y: number }>();
+  if (sorted.length < 3) { sorted.forEach((i) => res.set(i.id, { x: i.x, y: i.y })); return res; }
+  const first = sorted[0], last = sorted[sorted.length - 1];
+  const inner = sorted.slice(1, -1);
+  const gap = (last.y - (first.y + first.h) - inner.reduce((a, i) => a + i.h, 0)) / (inner.length + 1);
+  let cursor = first.y + first.h + gap;
+  res.set(first.id, { x: first.x, y: first.y });
+  res.set(last.id, { x: last.x, y: last.y });
+  for (const i of inner) { res.set(i.id, { x: i.x, y: Math.round(cursor) }); cursor += i.h + gap; }
+  return res;
+}
+
+function MultiSelInspector() {
+  const app = useStudio();
+  const { sel, page } = app;
+  const items: AlItem[] = [];
+  if (sel.kind === 'state') {
+    for (const id of sel.ids) {
+      const s = page.states.find((x) => x.id === id);
+      if (s) { const sz = nodeSize(s, app.doc.settings); items.push({ id, x: s.position.x, y: s.position.y, w: sz.w, h: sz.h }); }
+    }
+  } else if (sel.kind === 'flow') {
+    for (const id of sel.ids) {
+      const n = findFlowNode(page.flowNodes, id);
+      if (n) items.push({ id, x: n.x, y: n.y, w: n.w, h: n.h });
+    }
+  } else if (sel.kind === 'wb') {
+    for (const id of sel.ids) {
+      const w = page.wbShapes.find((x) => x.id === id);
+      if (w) items.push({ id, x: Math.min(w.x, w.x + w.w), y: Math.min(w.y, w.y + w.h), w: Math.abs(w.w) || 1, h: Math.abs(w.h) || 1 }); }
+  }
+
+  const applyMove = (pos: Map<string, { x: number; y: number }>) => {
+    app.updatePage((p) => {
+      if (sel.kind === 'state') {
+        return { ...p, states: p.states.map((s) => { const np = pos.get(s.id); return np ? { ...s, position: { x: np.x, y: np.y } } : s; }) };
+      }
+      if (sel.kind === 'flow') {
+        const rec = (ns: FlowNode[]): FlowNode[] => ns.map((n) => {
+          const np = pos.get(n.id);
+          const base = np ? { ...n, x: np.x, y: np.y } : n;
+          return base.inner ? { ...base, inner: { nodes: rec(base.inner.nodes), edges: base.inner.edges } } : base;
+        });
+        return { ...p, flowNodes: rec(p.flowNodes) };
+      }
+      if (sel.kind === 'wb') {
+        return {
+          ...p,
+          wbShapes: p.wbShapes.map((w) => {
+            const np = pos.get(w.id); if (!np) return w;
+            const ox = Math.min(w.x, w.x + w.w), oy = Math.min(w.y, w.y + w.h);
+            return { ...w, x: w.x + (np.x - ox), y: w.y + (np.y - oy) };
+          }),
+        };
+      }
+      return p;
+    });
+  };
+
+  if (items.length < 2) return null;
+  const minX = Math.min(...items.map((i) => i.x));
+  const maxX2 = Math.max(...items.map((i) => i.x + i.w));
+  const minY = Math.min(...items.map((i) => i.y));
+  const maxY2 = Math.max(...items.map((i) => i.y + i.h));
+  const mk = (fn: (i: AlItem) => { x: number; y: number }) => new Map(items.map((i) => [i.id, fn(i)]));
+
+  const ops = [
+    { k: 'left', t: '左对齐', d: AL.left, run: () => mk((i) => ({ x: minX, y: i.y })) },
+    { k: 'hc', t: '水平居中', d: AL.hcenter, run: () => mk((i) => ({ x: Math.round((minX + maxX2) / 2 - i.w / 2), y: i.y })) },
+    { k: 'right', t: '右对齐', d: AL.right, run: () => mk((i) => ({ x: maxX2 - i.w, y: i.y })) },
+    { k: 'distH', t: '水平等距分布', d: AL.distH, run: () => distH(items) },
+    { k: 'top', t: '顶对齐', d: AL.top, run: () => mk((i) => ({ x: i.x, y: minY })) },
+    { k: 'vc', t: '垂直居中', d: AL.vcenter, run: () => mk((i) => ({ x: i.x, y: Math.round((minY + maxY2) / 2 - i.h / 2) })) },
+    { k: 'bottom', t: '底对齐', d: AL.bottom, run: () => mk((i) => ({ x: i.x, y: maxY2 - i.h })) },
+    { k: 'distV', t: '垂直等距分布', d: AL.distV, run: () => distV(items) },
+  ];
+
+  return (
+    <div>
+      <Head title={`已选中 ${items.length} 个元素`} sub={sel.kind === 'state' ? '状态' : sel.kind === 'flow' ? '流程节点' : '白板元素'} />
+      <div className="px-3.5 pb-2 pt-3">
+        <div className="text-[10.5px] font-bold mb-1.5" style={{ color: 'var(--muted)' }}>对齐（基准 = 选中集包围盒）</div>
+        <div className="grid grid-cols-4 gap-1.5">
+          {ops.map((o) => (
+            <button key={o.k} title={o.t} aria-label={o.t} onClick={() => applyMove(o.run())}
+              className="h-8 rounded-lg flex items-center justify-center border transition-all hover:border-[var(--accent)] hover:text-[var(--accent)] active:scale-95"
+              style={{ borderColor: 'var(--border)', background: 'var(--panel-2)', color: 'var(--text)' }}>
+              <BkIcon d={o.d} size={15} />
+            </button>
+          ))}
+        </div>
+        {items.length < 3 && <div className="mt-1.5 text-[10px]" style={{ color: 'var(--muted)' }}>等距分布需至少选中 3 个元素</div>}
+      </div>
+      <div className="px-3.5 pb-3">
+        <button className="btn justify-center w-full" style={{ color: '#e11d48', borderColor: 'color-mix(in srgb, #e11d48 40%, transparent)' }}
+          onClick={() => app.deleteSel()}>
+          <BkIcon d={BI.trash} size={13} /> 删除选中的 {items.length} 个
+        </button>
+      </div>
     </div>
   );
 }

@@ -57,8 +57,6 @@ export function UnifiedCanvas() {
   /* 框选（屏幕坐标）/ 拖入子流程高亮 / 左侧拖入画布高亮 */
   const [marquee, setMarquee] = useState<null | { x1: number; y1: number; x2: number; y2: number }>(null);
   const [hoverTarget, setHoverTarget] = useState<HoverTarget>(null);
-  const [dropActive, setDropActive] = useState(false);
-  const dragEnterCount = useRef(0);
 
   /* ---------- 尺寸监听 ---------- */
   useEffect(() => {
@@ -95,6 +93,7 @@ export function UnifiedCanvas() {
     const key = d.path.join('/');
     const under = flat.panels
       .filter((pn) => pn.id !== d.id && !d.path.includes(pn.id)
+        && [...pn.path, pn.id].join('/') !== key /* 已在该面板内则不提示 */
         && w.x >= pn.x && w.x <= pn.x + pn.w && w.y >= pn.y && w.y <= pn.y + pn.h)
       .sort((a, b) => b.path.length - a.path.length);
     if (under.length) return { type: 'into', id: under[0].id };
@@ -236,18 +235,7 @@ export function UnifiedCanvas() {
   };
 
   /* ---------- 左侧工具拖放入画布（drawio 式） ---------- */
-  const onDragEnter = (e: React.DragEvent) => {
-    if (!e.dataTransfer.types.includes('text/x-sf-tool')) return;
-    dragEnterCount.current += 1;
-    setDropActive(true);
-  };
-  const onDragLeave = () => {
-    dragEnterCount.current = Math.max(0, dragEnterCount.current - 1);
-    if (dragEnterCount.current === 0) setDropActive(false);
-  };
   const onDrop = (e: React.DragEvent) => {
-    dragEnterCount.current = 0;
-    setDropActive(false);
     const t = e.dataTransfer.getData('text/x-sf-tool') as Tool;
     if (!t) return;
     e.preventDefault();
@@ -293,6 +281,15 @@ export function UnifiedCanvas() {
   const startMove = (e: React.PointerEvent, d: Drag) => {
     if (e.button !== 0) return;
     e.stopPropagation();
+    if (d.mode === 'move-panel') {
+      /* 子流程面板：从头部栏整体拖动（不参与选择集逻辑） */
+      const p = pt(e); const w = toWorld(p.x, p.y);
+      d.swx = w.x; d.swy = w.y;
+      beginBatch();
+      dragRef.current = d;
+      capture(e);
+      return;
+    }
     if (d.mode !== 'move-state' && d.mode !== 'move-flow' && d.mode !== 'move-wb') return;
     const fam = famOf(d.mode);
     /* Ctrl/⌘+左键 与普通左键行为一致（元素上即选择并拖动）；空白处的平移由 onSvgPointerDown 处理 */
@@ -613,17 +610,7 @@ export function UnifiedCanvas() {
     <div ref={wrapRef} className="relative flex-1 min-w-0 overflow-hidden" style={{ background: th.canvas }}
       onContextMenu={(e) => e.preventDefault()}
       onDragOver={(e) => { if (e.dataTransfer.types.includes('text/x-sf-tool')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } }}
-      onDragEnter={onDragEnter} onDragLeave={onDragLeave} onDrop={onDrop}>
-      {/* 从左侧拖入工具时的高亮提示 */}
-      {dropActive && (
-        <div className="absolute inset-2 z-20 rounded-xl pointer-events-none flex items-center justify-center"
-          style={{ border: `2px dashed ${th.sel}`, background: 'color-mix(in srgb, var(--accent) 7%, transparent)' }}>
-          <div className="px-4 py-2 rounded-lg text-[13px] font-bold"
-            style={{ background: 'var(--panel)', color: 'var(--accent)', border: '1px solid var(--border)', boxShadow: 'var(--shadow)' }}>
-            松开以放置元素
-          </div>
-        </div>
-      )}
+      onDrop={onDrop}>
       <svg
         ref={svgRef}
         className="w-full h-full block touch-none"
