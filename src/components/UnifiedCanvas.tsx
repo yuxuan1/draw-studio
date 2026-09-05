@@ -84,6 +84,28 @@ export function UnifiedCanvas() {
       : { nodes: [] as FlatFlowNode[], edges: [] as ReturnType<typeof flattenFlow>['edges'], panels: [] as FlatPanel[] }),
     [page],
   );
+  /* hoverTarget 的 ref 镜像：pointerup 可能与最后一次 setState 同帧，读 ref 保证拿到最新值 */
+  const hoverTargetRef = useRef<HoverTarget>(null);
+  const setHoverTarget2 = (ht: HoverTarget) => {
+    hoverTargetRef.current = ht;
+    setHoverTarget(ht);
+  };
+  /** 拖拽悬停检测：取指针下最内层面板（排除自身与所有祖先面板）；拖出时指向自己的容器 */
+  const detectHover = (d: Extract<Drag, { mode: 'move-flow' }>, w: { x: number; y: number }): HoverTarget => {
+    const key = d.path.join('/');
+    const under = flat.panels
+      .filter((pn) => pn.id !== d.id && !d.path.includes(pn.id)
+        && w.x >= pn.x && w.x <= pn.x + pn.w && w.y >= pn.y && w.y <= pn.y + pn.h)
+      .sort((a, b) => b.path.length - a.path.length);
+    if (under.length) return { type: 'into', id: under[0].id };
+    if (d.path.length) {
+      const cont = flat.panels.find((pn) => [...pn.path, pn.id].join('/') === key);
+      if (cont && (w.x < cont.x || w.x > cont.x + cont.w || w.y < cont.y || w.y > cont.y + cont.h)) {
+        return { type: 'out', id: cont.id };
+      }
+    }
+    return null;
+  };
 
   /* ---------- 坐标换算 ---------- */
   const pt = (e: { clientX: number; clientY: number }) => {
@@ -273,15 +295,7 @@ export function UnifiedCanvas() {
     e.stopPropagation();
     if (d.mode !== 'move-state' && d.mode !== 'move-flow' && d.mode !== 'move-wb') return;
     const fam = famOf(d.mode);
-    /* Ctrl/⌘+点击：同族追加 / 取消选择（不拖动） */
-    if (e.ctrlKey || e.metaKey) {
-      if (sel.kind === fam && sel.ids.includes(d.id)) {
-        setSel({ kind: fam, ids: sel.ids.filter((x) => x !== d.id) });
-      } else {
-        setSel({ kind: fam, ids: [...(sel.kind === fam ? sel.ids : []), d.id] });
-      }
-      return;
-    }
+    /* Ctrl/⌘+左键 与普通左键行为一致（元素上即选择并拖动）；空白处的平移由 onSvgPointerDown 处理 */
     const p = pt(e); const w = toWorld(p.x, p.y);
     (d as { swx?: number }).swx = w.x;
     (d as { swy?: number }).swy = w.y;
@@ -335,21 +349,7 @@ export function UnifiedCanvas() {
       }));
       updatePage(() => ({ ...d.base, flowNodes: r.nodes }), false);
       /* 单元素拖拽：检测是否悬浮于子流程面板（拖入）或拖出当前面板 */
-      if (d.ids.length === 1) {
-        let ht: HoverTarget = null;
-        const key = d.path.join('/');
-        const into = flat.panels.find((pn) => pn.id !== d.id && !pn.path.includes(d.id)
-          && pn.path.join('/') === key
-          && w.x >= pn.x && w.x <= pn.x + pn.w && w.y >= pn.y && w.y <= pn.y + pn.h);
-        if (into) ht = { type: 'into', id: into.id };
-        else if (d.path.length) {
-          const cont = flat.panels.find((pn) => [...pn.path, pn.id].join('/') === key);
-          if (cont && (w.x < cont.x || w.x > cont.x + cont.w || w.y < cont.y || w.y > cont.y + cont.h)) {
-            ht = { type: 'out', id: cont.id };
-          }
-        }
-        if ((ht?.id ?? '') !== (hoverTarget?.id ?? '') || (ht?.type ?? '') !== (hoverTarget?.type ?? '')) setHoverTarget(ht);
-      }
+      if (d.ids.length === 1) setHoverTarget2(detectHover(d, w));
     } else if (d.mode === 'move-wb') {
       const w = toWorld(p.x, p.y);
       const snap = settings.snapToGrid ? GRID_SNAP : 1;
@@ -412,25 +412,35 @@ export function UnifiedCanvas() {
     }
 
     if (d.mode === 'move-flow') {
-      /* 单元素拖入/拖出子流程面板：层级过继 */
-      if (d.ids.length === 1 && hoverTarget) {
+      /* 单元素拖入/拖出子流程面板：层级过继。读 ref 防同帧 stale */
+      const ht = hoverTargetRef.current;
+      if (d.ids.length === 1 && ht) {
         const node = findFlowNode(d.base.flowNodes, d.id);
         if (node) {
           const p = pt(e); const w = toWorld(p.x, p.y);
           const snap = settings.snapToGrid ? GRID_SNAP : 1;
+          /* 元素当前的世界左上角（保持拖拽时的抓取偏移，落点即鼠标处，无跳变） */
           const fw = {
             x: Math.round((node.x + (w.x - d.swx)) / snap) * snap,
             y: Math.round((node.y + (w.y - d.swy)) / snap) * snap,
+          };
+          /* 某层级路径对应的世界坐标原点：顶层=(0,0)；嵌套层=父面板内容区左上角 */
+          const levelOrigin = (path: string[]) => {
+            if (!path.length) return { x: 0, y: 0 };
+            const parentId = path[path.length - 1];
+            const pn = flat.panels.find((q) => q.id === parentId && q.path.join('/') === path.slice(0, -1).join('/'));
+            return pn ? { x: pn.x + C_PAD, y: pn.y + C_HEADER } : { x: 0, y: 0 };
           };
           const stripLevel = (f: { nodes: FlowNode[]; edges: FlowEdge[] }) => ({
             nodes: f.nodes.filter((n) => n.id !== d.id),
             edges: f.edges.filter((ed) => ed.source !== d.id && ed.target !== d.id),
           });
-          if (hoverTarget.type === 'into') {
-            const panel = flat.panels.find((pn) => pn.id === hoverTarget.id);
+          if (ht.type === 'into') {
+            const panel = flat.panels.find((pn) => pn.id === ht.id);
             if (panel) {
+              /* 目标 = 面板内部层级 [...panel.path, panel.id]，原点 = 面板内容区左上角 */
               const removed = mapFlowLevel(d.base.flowNodes, d.base.flowEdges, d.path, stripLevel);
-              const added = mapFlowLevel(removed.nodes, removed.edges, panel.path, (f) => ({
+              const added = mapFlowLevel(removed.nodes, removed.edges, [...panel.path, panel.id], (f) => ({
                 ...f,
                 nodes: [...f.nodes, { ...node, x: fw.x - (panel.x + C_PAD), y: fw.y - (panel.y + C_HEADER) }],
               }));
@@ -438,12 +448,14 @@ export function UnifiedCanvas() {
               toast('已移入子流程');
             }
           } else {
-            const cont = flat.panels.find((pn) => pn.id === hoverTarget.id);
+            const cont = flat.panels.find((pn) => pn.id === ht.id);
             if (cont) {
+              /* 目标 = 容器的父层级 cont.path，坐标换算到该层原点 */
+              const o = levelOrigin(cont.path);
               const removed = mapFlowLevel(d.base.flowNodes, d.base.flowEdges, d.path, stripLevel);
               const added = mapFlowLevel(removed.nodes, removed.edges, cont.path, (f) => ({
                 ...f,
-                nodes: [...f.nodes, { ...node, x: fw.x + cont.x + C_PAD, y: fw.y + cont.y + C_HEADER }],
+                nodes: [...f.nodes, { ...node, x: fw.x - o.x, y: fw.y - o.y }],
               }));
               updatePage(() => ({ ...d.base, flowNodes: added.nodes, flowEdges: added.edges }), false);
               toast('已移出子流程');
@@ -451,7 +463,7 @@ export function UnifiedCanvas() {
           }
         }
       }
-      setHoverTarget(null);
+      setHoverTarget2(null);
     }
 
     if (d.mode === 'move-state' || d.mode === 'move-flow' || d.mode === 'move-wb' || d.mode === 'move-panel') endBatch();
@@ -598,7 +610,20 @@ export function UnifiedCanvas() {
     : !page.wbShapes.length;
 
   return (
-    <div ref={wrapRef} className="relative flex-1 min-w-0 overflow-hidden" style={{ background: th.canvas }}>
+    <div ref={wrapRef} className="relative flex-1 min-w-0 overflow-hidden" style={{ background: th.canvas }}
+      onContextMenu={(e) => e.preventDefault()}
+      onDragOver={(e) => { if (e.dataTransfer.types.includes('text/x-sf-tool')) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } }}
+      onDragEnter={onDragEnter} onDragLeave={onDragLeave} onDrop={onDrop}>
+      {/* 从左侧拖入工具时的高亮提示 */}
+      {dropActive && (
+        <div className="absolute inset-2 z-20 rounded-xl pointer-events-none flex items-center justify-center"
+          style={{ border: `2px dashed ${th.sel}`, background: 'color-mix(in srgb, var(--accent) 7%, transparent)' }}>
+          <div className="px-4 py-2 rounded-lg text-[13px] font-bold"
+            style={{ background: 'var(--panel)', color: 'var(--accent)', border: '1px solid var(--border)', boxShadow: 'var(--shadow)' }}>
+            松开以放置元素
+          </div>
+        </div>
+      )}
       <svg
         ref={svgRef}
         className="w-full h-full block touch-none"
@@ -701,6 +726,17 @@ export function UnifiedCanvas() {
             resizable={!!resizeTarget} onResizeBegin={beginBatch} onResize={onResize} onResizeEnd={endBatch} />
         )}
       </svg>
+
+      {/* 框选矩形（屏幕坐标） */}
+      {marquee && (
+        <div className="absolute z-10 pointer-events-none"
+          style={{
+            left: Math.min(marquee.x1, marquee.x2), top: Math.min(marquee.y1, marquee.y2),
+            width: Math.abs(marquee.x2 - marquee.x1), height: Math.abs(marquee.y2 - marquee.y1),
+            border: `1.5px dashed ${th.sel}`, borderRadius: 4,
+            background: 'color-mix(in srgb, var(--accent) 9%, transparent)',
+          }} />
+      )}
 
       {isEmpty && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

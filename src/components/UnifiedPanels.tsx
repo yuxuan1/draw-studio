@@ -21,18 +21,25 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
   );
 }
 
-function ToolBtn({ icon, label, active, onClick, title }: {
-  icon: ReactNode; label: string; active: boolean; onClick: () => void; title?: string;
+function ToolBtn({ icon, label, active, onClick, title, dragTool }: {
+  icon: ReactNode; label: string; active: boolean; onClick: () => void; title?: string; dragTool?: string;
 }) {
   return (
     <button
       onClick={onClick}
       title={title ?? label}
+      draggable={!!dragTool}
+      onDragStart={(e) => {
+        if (!dragTool) return;
+        e.dataTransfer.setData('text/x-sf-tool', dragTool);
+        e.dataTransfer.effectAllowed = 'copy';
+      }}
       className="flex flex-col items-center gap-1 py-2 rounded-lg text-[10.5px] font-semibold transition-all border"
       style={{
         borderColor: active ? 'var(--accent)' : 'var(--border)',
         background: active ? 'var(--accent-soft)' : 'var(--panel-2)',
         color: active ? 'var(--accent)' : 'var(--text)',
+        cursor: dragTool ? 'grab' : 'pointer',
       }}
     >
       {icon}
@@ -89,9 +96,9 @@ export function LeftPanel() {
         <>
           <Section title="状态机">
             <div className="grid grid-cols-3 gap-1.5">
-              <ToolBtn icon={<BkIcon d={BI.rect} size={17} />} label="状态" active={tool === 'sm-state'} onClick={() => setTool('sm-state')} title="状态（双击画布也可新建）" />
-              <ToolBtn icon={<BkIcon d="M5 6h14v12H5zm3 3h8v6H8z" size={17} />} label="终止" active={tool === 'sm-terminal'} onClick={() => setTool('sm-terminal')} title="终止状态（双线框）" />
-              <ToolBtn icon={<BkIcon d="M12 5a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm0 5a2 2 0 1 0 0 4" size={17} />} label="连接点" active={tool === 'sm-junction'} onClick={() => setTool('sm-junction')} title="连接点（分支汇合）" />
+              <ToolBtn icon={<BkIcon d={BI.rect} size={17} />} label="状态" active={tool === 'sm-state'} onClick={() => setTool('sm-state')} dragTool="sm-state" title="点击选用，或拖入画布" />
+              <ToolBtn icon={<BkIcon d="M5 6h14v12H5zm3 3h8v6H8z" size={17} />} label="终止" active={tool === 'sm-terminal'} onClick={() => setTool('sm-terminal')} dragTool="sm-terminal" title="终止状态（双线框），可拖入画布" />
+              <ToolBtn icon={<BkIcon d="M12 5a7 7 0 1 0 0 14 7 7 0 0 0 0-14Zm0 5a2 2 0 1 0 0 4" size={17} />} label="连接点" active={tool === 'sm-junction'} onClick={() => setTool('sm-junction')} dragTool="sm-junction" title="连接点（分支汇合），可拖入画布" />
             </div>
             <p className="text-[10.5px] leading-4 mt-2" style={{ color: 'var(--muted)' }}>
               悬停状态拖出圆点 → 连到另一状态即创建转移
@@ -100,11 +107,11 @@ export function LeftPanel() {
 
           <Section title="流程图">
             <div className="grid grid-cols-3 gap-1.5">
-              <ToolBtn icon={<BkIcon d="M5 9a7 3.5 0 0 1 14 0v6a7 3.5 0 0 1-14 0z" size={17} />} label="开始" active={tool === 'flow-start'} onClick={() => setTool('flow-start')} />
-              <ToolBtn icon={<BkIcon d={BI.rect} size={17} />} label="流程" active={tool === 'flow-process'} onClick={() => setTool('flow-process')} />
-              <ToolBtn icon={<BkIcon d="M12 4l8 8-8 8-8-8z" size={17} />} label="判定" active={tool === 'flow-decision'} onClick={() => setTool('flow-decision')} />
-              <ToolBtn icon={<BkIcon d="M8 6h12l-4 12H4z" size={17} />} label="输入/出" active={tool === 'flow-io'} onClick={() => setTool('flow-io')} />
-              <ToolBtn icon={<BkIcon d="M4 5h16v14H4zm3 3h10v8H7z" size={17} />} label="子流程" active={tool === 'flow-subprocess'} onClick={() => setTool('flow-subprocess')} title="子流程：可展开为完整小流程图" />
+              <ToolBtn icon={<BkIcon d="M5 9a7 3.5 0 0 1 14 0v6a7 3.5 0 0 1-14 0z" size={17} />} label="开始" active={tool === 'flow-start'} onClick={() => setTool('flow-start')} dragTool="flow-start" title="开始/结束，可拖入画布" />
+              <ToolBtn icon={<BkIcon d={BI.rect} size={17} />} label="流程" active={tool === 'flow-process'} onClick={() => setTool('flow-process')} dragTool="flow-process" title="流程节点，可拖入画布" />
+              <ToolBtn icon={<BkIcon d="M12 4l8 8-8 8-8-8z" size={17} />} label="判定" active={tool === 'flow-decision'} onClick={() => setTool('flow-decision')} dragTool="flow-decision" title="判定（菱形），可拖入画布" />
+              <ToolBtn icon={<BkIcon d="M8 6h12l-4 12H4z" size={17} />} label="输入/出" active={tool === 'flow-io'} onClick={() => setTool('flow-io')} dragTool="flow-io" title="输入/输出，可拖入画布" />
+              <ToolBtn icon={<BkIcon d="M4 5h16v14H4zm3 3h10v8H7z" size={17} />} label="子流程" active={tool === 'flow-subprocess'} onClick={() => setTool('flow-subprocess')} dragTool="flow-subprocess" title="子流程：可展开为完整小流程图，可拖入画布" />
             </div>
             <div className="flex items-center gap-1.5 mt-2.5">
               <div className="seg flex-1">
