@@ -177,12 +177,28 @@ kbd {
   font-family: "Space Grotesk", monospace; font-size: 11px; text-align: center;
 }
 
-/* ---------- 流程图 / 白板编辑器 ---------- */
-.canvas-bg {
-  background-image: radial-gradient(color-mix(in srgb, var(--muted) 30%, transparent) 1px, transparent 1px);
-  background-size: 24px 24px;
-  background-color: var(--app-bg);
+/* ---------- 统一画布顶栏菜单 / Toast ---------- */
+.menu-label {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 6px 10px; border-radius: 8px; font-size: 12.5px; font-weight: 600;
+  color: var(--text); background: transparent; border: 1px solid transparent;
+  cursor: pointer; transition: background 0.15s, border-color 0.15s;
 }
-.seg-on { background: var(--panel-2); color: var(--accent); box-shadow: var(--shadow); font-weight: 700; }
+.menu-label:hover, .menu-label.open { background: var(--panel-2); border-color: var(--border); }
+
+.menu-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  padding: 7px 12px; font-size: 12.5px; font-weight: 500; color: var(--text);
+  background: transparent; border: none; cursor: pointer; transition: background 0.12s;
+}
+.menu-item:hover { background: var(--accent-soft); color: var(--accent); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.toast { animation: toast-in 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.2); }
+
+.seg-on { background: var(--panel); color: var(--accent); box-shadow: var(--shadow); font-weight: 700; }
 .seg-off { color: var(--muted); }
 .seg-off:hover { color: var(--text); background: var(--panel); }
