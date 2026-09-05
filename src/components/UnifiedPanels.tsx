@@ -7,7 +7,7 @@ import { useStudio } from '../studioStore';
 import { COLOR_ORDER, COLOR_LABELS, PALETTES, formatLabel } from '../lib/core';
 import type { PaletteColor, ProjectTransition } from '../lib/core';
 import {
-  findFlowNode, layoutFlowGraph, makeFlowNode, nid, updateFlowNode,
+  findFlowNode, layoutFlowGraph, makeFlowNode, nid, updateFlowNode, toggleSubInDoc,
 } from '../lib/studio';
 import type { FlowKind, WbShape } from '../lib/studio';
 import { BkIcon, BI, BOARD_COLORS, NEUTRAL_STROKES } from '../lib/boardkit';
@@ -376,7 +376,7 @@ function FlowInspector({ id }: { id: string }) {
           onChange={(e) => {
             const k = e.target.value as FlowKind;
             up(k === 'subprocess'
-              ? { kind: k, inner: n.inner ?? { nodes: [], edges: [] }, expanded: true }
+              ? { kind: k, inner: n.inner ?? { nodes: [], edges: [] }, expanded: false }
               : { kind: k });
           }}>
           {KINDS.map((k) => <option key={k.v} value={k.v}>{k.t}</option>)}
@@ -416,7 +416,10 @@ function FlowInspector({ id }: { id: string }) {
               展开（{n.inner?.nodes.length ?? 0} 个内部节点）
             </span>
             <button className={`switch ${n.expanded ? 'on' : ''}`}
-              onClick={() => up({ expanded: !n.expanded })} aria-label="展开子流程">
+              onClick={() => {
+                const r = toggleSubInDoc(app.page.flowNodes, app.page.flowEdges, n.id, app.page.flowDir);
+                app.updatePage((p) => ({ ...p, flowNodes: r.nodes, flowEdges: r.edges }));
+              }} aria-label="展开子流程">
               <span className="absolute top-[2px] rounded-full bg-white transition-all"
                 style={{ width: 15, height: 15, left: n.expanded ? 17 : 2, boxShadow: '0 1px 2px rgba(0,0,0,.25)' }} />
             </button>
@@ -425,7 +428,15 @@ function FlowInspector({ id }: { id: string }) {
             <button className="btn flex-1 justify-center !text-[11px]" onClick={() => {
               const inner = n.inner ?? { nodes: [], edges: [] };
               const nn = makeFlowNode('process', 20 + inner.nodes.length * 30, 20);
-              up({ inner: { ...inner, nodes: [...inner.nodes, nn] }, expanded: true });
+              let fnodes = updateFlowNode(app.page.flowNodes, n.id, { inner: { ...inner, nodes: [...inner.nodes, nn] } });
+              if (!n.expanded) {
+                fnodes = toggleSubInDoc(fnodes, app.page.flowEdges, n.id, app.page.flowDir).nodes;
+              } else {
+                fnodes = updateFlowNode(fnodes, n.id, {
+                  inner: { nodes: layoutFlowGraph([...inner.nodes, nn], inner.edges, app.page.flowDir), edges: inner.edges },
+                });
+              }
+              app.updatePage((p) => ({ ...p, flowNodes: fnodes }));
               app.setSel({ kind: 'flow', id: nn.id });
             }}><BkIcon d={BI.plus} size={13} /> 内部节点</button>
             <button className="btn flex-1 justify-center !text-[11px]" onClick={() => {
@@ -434,7 +445,7 @@ function FlowInspector({ id }: { id: string }) {
             }}><BkIcon d={BI.expand} size={13} /> 整理内部</button>
           </div>
           <p className="px-3.5 pb-2 text-[10.5px] leading-4" style={{ color: 'var(--muted)' }}>
-            展开后内部是独立小流程图：可继续添加结点、连线，甚至嵌套新的子流程；双击容器头部外区域或右上角徽标可收纳。
+            展开时在侧向弹出浮动面板（自动避让周围元素），虚线系绳连回结点。面板可整体拖动、内部结点可手动摆位，位置会被记住；收纳后再次展开仍回到原处。
           </p>
         </>
       )}
