@@ -7,10 +7,12 @@ import {
 import type { ReactNode } from 'react';
 import { useHistory } from './lib/boardkit';
 import type { Page, PageType, StudioDoc } from './lib/studio';
-import { loadStudio, makePage, pruneFlow, saveStudio } from './lib/studio';
+import { loadStudio, makePage, nid, pruneFlow, saveStudio } from './lib/studio';
 
 export type SelKind = 'state' | 'transition' | 'flow' | 'flowEdge' | 'wb' | null;
-export interface Sel { kind: SelKind; id: string | null }
+/** id 为单选兼容字段（= ids[0]）；ids 支持框选/Ctrl 多选 */
+export interface Sel { kind: SelKind; id: string | null; ids: string[] }
+export type SelInput = { kind: SelKind; id?: string | null; ids?: string[] };
 
 export type Tool =
   | 'select'
@@ -32,7 +34,7 @@ interface StudioCtx {
   canUndo: boolean;
   canRedo: boolean;
   sel: Sel;
-  setSel: (s: Sel) => void;
+  setSel: (s: SelInput) => void;
   deleteSel: () => void;
   tool: Tool;
   setTool: (t: Tool) => void;
@@ -44,6 +46,7 @@ interface StudioCtx {
   savedAt: number;
   /* 页面操作 */
   addPage: (type: PageType) => void;
+  duplicatePage: (id: string) => void;
   renamePage: (id: string, name: string) => void;
   deletePage: (id: string) => void;
   setActivePage: (id: string) => void;
@@ -64,7 +67,12 @@ export function StudioProvider({ children }: { children: ReactNode }) {
   const docRef = useRef(hist.value);
   docRef.current = hist.value;
 
-  const [sel, setSel] = useState<Sel>({ kind: null, id: null });
+  const [sel, _setSel] = useState<Sel>({ kind: null, id: null, ids: [] });
+  const setSel = useCallback((s: SelInput) => {
+    const id = s.id ?? (s.ids && s.ids.length ? s.ids[0] : null);
+    const ids = s.ids ?? (id ? [id] : []);
+    _setSel({ kind: ids.length ? s.kind : null, id: ids.length ? id : null, ids });
+  }, []);
   const [tool, setTool] = useState<Tool>('select');
   const [fitSignal, setFitSignal] = useState(0);
   const [toasts, setToasts] = useState<Toast[]>([]);
@@ -119,6 +127,19 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     toast('页面已删除');
   }, [hist, toast]);
 
+  const duplicatePage = useCallback((id: string) => {
+    const d = docRef.current;
+    const src = d.pages.find((p) => p.id === id);
+    if (!src) return;
+    const copy = JSON.parse(JSON.stringify(src)) as Page;
+    copy.id = nid('p');
+    copy.name = `${src.name} 副本`;
+    hist.set({ ...d, pages: [...d.pages, copy], activePageId: copy.id });
+    setSel({ kind: null });
+    setFitSignal((n) => n + 1);
+    toast(`已复制页面「${src.name}」`);
+  }, [hist, toast, setSel]);
+
   const setActivePage = useCallback((id: string) => {
     const d = docRef.current;
     if (d.activePageId === id) return;
@@ -128,34 +149,43 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     setFitSignal((n) => n + 1);
   }, [hist]);
 
-  /* ---------- 删除选中（级联 / 递归） ---------- */
+  /* ---------- 删除选中（级联 / 递归，支持批量） ---------- */
   const deleteSel = useCallback(() => {
     const s = sel;
-    if (!s.id) return;
+    if (!s.ids.length) return;
     const d = docRef.current;
     const p = d.pages.find((x) => x.id === d.activePageId);
     if (!p) return;
+    const ids = new Set(s.ids);
     let next: Page = p;
     if (s.kind === 'state') {
       next = {
         ...p,
-        states: p.states.filter((x) => x.id !== s.id),
-        transitions: p.transitions.filter((t) => t.source !== s.id && t.target !== s.id),
+        states: p.states.filter((x) => !ids.has(x.id)),
+        transitions: p.transitions.filter((t) => !ids.has(t.source) && !ids.has(t.target)),
       };
     } else if (s.kind === 'transition') {
-      next = { ...p, transitions: p.transitions.filter((t) => t.id !== s.id) };
+      next = { ...p, transitions: p.transitions.filter((t) => !ids.has(t.id)) };
     } else if (s.kind === 'flow') {
-      const r = pruneFlow(p.flowNodes, p.flowEdges, s.id);
-      next = { ...p, flowNodes: r.nodes, flowEdges: r.edges };
+      let { flowNodes, flowEdges } = p;
+      for (const id of s.ids) {
+        const r = pruneFlow(flowNodes, flowEdges, id);
+        flowNodes = r.nodes; flowEdges = r.edges;
+      }
+      next = { ...p, flowNodes, flowEdges };
     } else if (s.kind === 'flowEdge') {
-      const r = pruneFlow(p.flowNodes, p.flowEdges, s.id);
-      next = { ...p, flowNodes: r.nodes, flowEdges: r.edges };
+      let { flowNodes, flowEdges } = p;
+      for (const id of s.ids) {
+        const r = pruneFlow(flowNodes, flowEdges, id);
+        flowNodes = r.nodes; flowEdges = r.edges;
+      }
+      next = { ...p, flowNodes, flowEdges };
     } else if (s.kind === 'wb') {
-      next = { ...p, wbShapes: p.wbShapes.filter((w) => w.id !== s.id) };
+      next = { ...p, wbShapes: p.wbShapes.filter((w) => !ids.has(w.id)) };
     }
     hist.set({ ...d, pages: d.pages.map((x) => (x.id === p.id ? next : x)) });
-    setSel({ kind: null, id: null });
-  }, [sel, hist]);
+    setSel({ kind: null });
+  }, [sel, hist, setSel]);
 
   /* ---------- 自动保存（600ms 防抖） ---------- */
   useEffect(() => {
@@ -205,9 +235,9 @@ export function StudioProvider({ children }: { children: ReactNode }) {
     fitSignal, requestFit,
     toasts, toast,
     theme, savedAt,
-    addPage, renamePage, deletePage, setActivePage,
+    addPage, duplicatePage, renamePage, deletePage, setActivePage,
     exportHandle,
-  }), [doc, page, hist, updatePage, sel, deleteSel, tool, fitSignal, toasts, toast, theme, savedAt, addPage, renamePage, deletePage, setActivePage, requestFit]);
+  }), [doc, page, hist, updatePage, sel, deleteSel, tool, fitSignal, toasts, toast, theme, savedAt, addPage, duplicatePage, renamePage, deletePage, setActivePage, requestFit]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
