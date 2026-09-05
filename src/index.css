@@ -176,3 +176,13 @@ kbd {
   background: var(--panel); color: var(--text);
   font-family: "Space Grotesk", monospace; font-size: 11px; text-align: center;
 }
+
+/* ---------- 流程图 / 白板编辑器 ---------- */
+.canvas-bg {
+  background-image: radial-gradient(color-mix(in srgb, var(--muted) 30%, transparent) 1px, transparent 1px);
+  background-size: 24px 24px;
+  background-color: var(--app-bg);
+}
+.seg-on { background: var(--panel-2); color: var(--accent); box-shadow: var(--shadow); font-weight: 700; }
+.seg-off { color: var(--muted); }
+.seg-off:hover { color: var(--text); background: var(--panel); }
