@@ -12,10 +12,10 @@ import type { Page } from '../lib/studio';
 import { shapesOf, computeEdgeGeoms, arrowPoints } from '../lib/geometry';
 import type { EdgeGeom } from '../lib/geometry';
 import {
-  flattenFlow, mapFlowLevel, updateFlowNode, findFlowNode, layoutFlowGraph,
+  flattenFlow, mapFlowLevel, updateFlowNode, findFlowNode, toggleSubInDoc,
   makeFlowNode, makeWbShape, makeSmState, nid, C_HEADER,
 } from '../lib/studio';
-import type { FlowKind, FlatFlowNode, WbShape } from '../lib/studio';
+import type { FlowKind, FlatFlowNode, FlatPanel, WbShape, Rect } from '../lib/studio';
 import { wrapText, BkIcon, BI } from '../lib/boardkit';
 
 interface View { x: number; y: number; k: number }
@@ -27,6 +27,7 @@ type Drag =
   | { mode: 'move-state'; id: string; swx: number; swy: number; base: Page }
   | { mode: 'move-flow'; id: string; path: string[]; swx: number; swy: number; base: Page }
   | { mode: 'move-wb'; id: string; swx: number; swy: number; base: Page }
+  | { mode: 'move-panel'; id: string; swx: number; swy: number; base: Page }
   | { mode: 'connect'; from: ConnEndpoint; x: number; y: number }
   | { mode: 'wb-draw'; id: string; sx: number; sy: number };
 
@@ -68,7 +69,9 @@ export function UnifiedCanvas() {
   const shapes = useMemo(() => shapesOf(smDoc, settings), [smDoc, settings]);
   const edges = useMemo(() => computeEdgeGeoms(smDoc, settings, theme), [smDoc, settings, theme]);
   const flat = useMemo(
-    () => (page.type === 'canvas' ? flattenFlow(page.flowNodes, page.flowEdges) : { nodes: [] as FlatFlowNode[], edges: [] as ReturnType<typeof flattenFlow>['edges'] }),
+    () => (page.type === 'canvas'
+      ? flattenFlow(page.flowNodes, page.flowEdges)
+      : { nodes: [] as FlatFlowNode[], edges: [] as ReturnType<typeof flattenFlow>['edges'], panels: [] as FlatPanel[] }),
     [page],
   );
 
@@ -90,6 +93,7 @@ export function UnifiedCanvas() {
     if (page.type === 'canvas') {
       for (const s of page.states) { const sh = shapes.get(s.id); if (sh) eat(sh.x, sh.y, sh.w, sh.h); }
       for (const f of flat.nodes) eat(f.x, f.y, f.w, f.h);
+      for (const pn of flat.panels) eat(pn.x, pn.y, pn.w, pn.h);
     } else {
       for (const w of page.wbShapes) eat(w.x, w.y, Math.abs(w.w), Math.max(20, Math.abs(w.h)));
     }
@@ -272,6 +276,14 @@ export function UnifiedCanvas() {
       const nx = Math.round((orig.x + (w.x - d.swx)) / snap) * snap;
       const ny = Math.round((orig.y + (w.y - d.swy)) / snap) * snap;
       updatePage(() => ({ ...d.base, wbShapes: d.base.wbShapes.map((s) => (s.id === d.id ? { ...s, x: nx, y: ny } : s)) }), false);
+    } else if (d.mode === 'move-panel') {
+      /* 面板整体移动：expandPos 与结点同坐标系（纯平移层级，世界增量=局部增量） */
+      const w = toWorld(p.x, p.y);
+      const snap = settings.snapToGrid ? GRID_SNAP : 1;
+      const orig = findFlowNode(d.base.flowNodes, d.id); if (!orig || !orig.expandPos) return;
+      const nx = Math.round((orig.expandPos.x + (w.x - d.swx)) / snap) * snap;
+      const ny = Math.round((orig.expandPos.y + (w.y - d.swy)) / snap) * snap;
+      updatePage(() => ({ ...d.base, flowNodes: updateFlowNode(d.base.flowNodes, d.id, { expandPos: { x: nx, y: ny } }) }), false);
     } else if (d.mode === 'connect') {
       const w = toWorld(p.x, p.y);
       setConnect({ from: d.from, x: w.x, y: w.y });
@@ -287,7 +299,7 @@ export function UnifiedCanvas() {
   const onSvgPointerUp = (e: React.PointerEvent) => {
     const d = dragRef.current; dragRef.current = null;
     if (!d) return;
-    if (d.mode === 'move-state' || d.mode === 'move-flow' || d.mode === 'move-wb') endBatch();
+    if (d.mode === 'move-state' || d.mode === 'move-flow' || d.mode === 'move-wb' || d.mode === 'move-panel') endBatch();
     if (d.mode === 'wb-draw') {
       /* 规范化负尺寸；过小给默认值 */
       updatePage((pp) => ({
@@ -346,17 +358,15 @@ export function UnifiedCanvas() {
   const toggleSub = (id: string) => {
     const n = findFlowNode(page.flowNodes, id);
     if (!n || n.kind !== 'subprocess') return;
-    const willExpand = !n.expanded;
-    updatePage((p) => ({
-      ...p,
-      flowNodes: updateFlowNode(p.flowNodes, id, {
-        expanded: willExpand,
-        inner: willExpand && n.inner && n.inner.nodes.length
-          ? { ...n.inner, nodes: layoutFlowGraph(n.inner.nodes, n.inner.edges, p.flowDir) }
-          : n.inner,
-      }),
-    }));
+    /* 状态机也作为选址障碍物，避免面板压在状态结点上 */
+    const stateObs: Rect[] = [];
+    for (const s of page.states) { const sh = shapes.get(s.id); if (sh) stateObs.push({ x: sh.x, y: sh.y, w: sh.w, h: sh.h }); }
+    const r = toggleSubInDoc(page.flowNodes, page.flowEdges, id, page.flowDir, stateObs);
+    updatePage((p) => ({ ...p, flowNodes: r.nodes, flowEdges: r.edges }));
+    setSel({ kind: 'flow', id });
   };
+
+
 
   /* ---------- 选中框 / 缩放手柄 ---------- */
   const selFlat = useMemo(
@@ -465,22 +475,27 @@ export function UnifiedCanvas() {
             ))
           ) : (
             <>
-              {/* 子流程容器（底层） */}
-              {flat.nodes.filter((f) => f.n.kind === 'subprocess' && f.n.expanded).map((f) => (
-                <ContainerView key={'c' + f.n.id} f={f} theme={theme}
-                  selected={sel.kind === 'flow' && sel.id === f.n.id}
-                  onDown={(e) => startMove(e, { mode: 'move-flow', id: f.n.id, path: f.path, swx: 0, swy: 0, base: page })}
-                  onCollapse={() => toggleSub(f.n.id)}
-                  onHover={(h) => setHoverEP(h ? { family: 'flow', id: f.n.id, path: f.path, x: f.x, y: f.y } : null)} />
+              {/* 子流程浮动面板（底层：主体 + 头部，可整体拖拽/收纳） */}
+              {flat.panels.map((pn) => (
+                <PanelView key={'p' + pn.id} pn={pn} theme={theme}
+                  selected={sel.kind === 'flow' && sel.id === pn.id}
+                  onDownPanel={(e) => startMove(e, { mode: 'move-panel', id: pn.id, swx: 0, swy: 0, base: page })}
+                  onSelect={() => setSel({ kind: 'flow', id: pn.id })}
+                  onCollapse={() => toggleSub(pn.id)} />
               ))}
+              {/* 系绳：结点 ↔ 其展开面板 */}
+              {flat.panels.map((pn) => {
+                const node = flat.nodes.find((f) => f.n.id === pn.id);
+                return node ? <Tether key={'t' + pn.id} node={node} panel={pn} theme={theme} /> : null;
+              })}
               {/* 流程连线 */}
               {flat.edges.map((fe) => (
                 <FlowEdgeView key={fe.e.id} fe={fe} theme={theme}
                   selected={sel.kind === 'flowEdge' && sel.id === fe.e.id}
                   onSelect={() => setSel({ kind: 'flowEdge', id: fe.e.id })} />
               ))}
-              {/* 流程结点（非展开容器） */}
-              {flat.nodes.filter((f) => !(f.n.kind === 'subprocess' && f.n.expanded)).map((f) => (
+              {/* 流程结点（全部；展开的子流程以紧凑锚点呈现） */}
+              {flat.nodes.map((f) => (
                 <FlowNodeView key={f.n.id} f={f} theme={theme}
                   selected={sel.kind === 'flow' && sel.id === f.n.id}
                   onDown={(e) => startMove(e, { mode: 'move-flow', id: f.n.id, path: f.path, swx: 0, swy: 0, base: page })}
@@ -547,7 +562,7 @@ export function UnifiedCanvas() {
 
       {settings.showMiniMap && (
         <MiniMap bounds={bounds} view={view} size={size} theme={theme} page={page}
-          shapes={shapes} flat={flat.nodes}
+          shapes={shapes} flat={flat.nodes} panels={flat.panels}
           onJump={(wx, wy) => setView({ ...view, x: size.w / 2 - wx * view.k, y: size.h / 2 - wy * view.k })} />
       )}
       <ZoomCtl view={view} setView={setView} fit={fit} />
@@ -653,29 +668,31 @@ function FlowNodeView({ f, theme, selected, onDown, onExpand, onHover }: {
   const th = THEME[theme];
   const n = f.n;
   const fp = flowShapePath(f);
+  const isSub = n.kind === 'subprocess';
+  const isOpen = isSub && !!n.expanded;
   const lines = wrapText(n.text || ' ', Math.max(40, f.w - 24), 12.5);
   const cx = f.x + f.w / 2, cy = f.y + f.h / 2;
   const startY = cy - ((lines.length - 1) * 16) / 2;
   const innerCount = n.inner ? n.inner.nodes.length : 0;
   return (
     <g data-el="1" onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}
-      onDoubleClick={(e) => { if (n.kind === 'subprocess') { e.stopPropagation(); onExpand(); } }}>
+      onDoubleClick={(e) => { if (isSub) { e.stopPropagation(); onExpand(); } }}>
       {selected && <rect x={f.x - 4} y={f.y - 4} width={f.w + 8} height={f.h + 8} rx={13} fill="none" stroke={th.selGlow} strokeWidth={5} />}
       {fp.rect
-        ? <rect x={f.x} y={f.y} width={f.w} height={f.h} rx={10} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} />
-        : <path d={fp.d} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} strokeLinejoin="round" />}
-      {n.kind === 'subprocess' && (
+        ? <rect x={f.x} y={f.y} width={f.w} height={f.h} rx={10} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} strokeDasharray={isOpen ? '5 3' : undefined} />
+        : <path d={fp.d} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} strokeLinejoin="round" strokeDasharray={isOpen ? '5 3' : undefined} />}
+      {isSub && (
         <rect x={f.x + 4} y={f.y + 4} width={f.w - 8} height={f.h - 8} rx={7} fill="none" stroke={n.stroke} strokeWidth={1.1} opacity={0.75} />
       )}
       {lines.map((ln, i) => (
         <text key={i} x={cx} y={startY + i * 16} textAnchor="middle" dominantBaseline="middle"
           fontSize={12.5} fontWeight={600} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{ln}</text>
       ))}
-      {n.kind === 'subprocess' && (
+      {isSub && (
         <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onExpand(); }} data-noexport="1">
-          <circle cx={f.x + f.w - 2} cy={f.y + 2} r={9} fill={n.stroke} stroke="#fff" strokeWidth={1.2} />
-          <text x={f.x + f.w - 2} y={f.y + 2.5} textAnchor="middle" dominantBaseline="middle" fontSize={10} fontWeight={800} fill="#fff">
-            {innerCount > 0 ? `+${innerCount}` : '+'}
+          <circle cx={f.x + f.w - 2} cy={f.y + 2} r={9} fill={isOpen ? th.canvas : n.stroke} stroke={n.stroke} strokeWidth={1.4} />
+          <text x={f.x + f.w - 2} y={f.y + 2.5} textAnchor="middle" dominantBaseline="middle" fontSize={10} fontWeight={800} fill={isOpen ? n.stroke : '#fff'}>
+            {isOpen ? '−' : innerCount > 0 ? `+${innerCount}` : '+'}
           </text>
         </g>
       )}
@@ -683,37 +700,65 @@ function FlowNodeView({ f, theme, selected, onDown, onExpand, onHover }: {
   );
 }
 
-function ContainerView({ f, theme, selected, onDown, onCollapse, onHover }: {
-  f: FlatFlowNode; theme: 'light' | 'dark'; selected: boolean;
-  onDown: (e: React.PointerEvent) => void; onCollapse: () => void; onHover: (h: boolean) => void;
+/** 浮动面板：主体（透传点击）+ 头部（可拖拽/选中/收纳），内部结点由全局结点层渲染在其上 */
+function PanelView({ pn, theme, selected, onDownPanel, onSelect, onCollapse }: {
+  pn: FlatPanel; theme: 'light' | 'dark'; selected: boolean;
+  onDownPanel: (e: React.PointerEvent) => void; onSelect: () => void; onCollapse: () => void;
 }) {
   const th = THEME[theme];
-  const n = f.n;
+  const n = pn.n;
   const innerCount = n.inner ? n.inner.nodes.length : 0;
   return (
-    <g data-el="1" onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)}>
-      {selected && <rect x={f.x - 4} y={f.y - 4} width={f.w + 8} height={f.h + 8} rx={14} fill="none" stroke={th.selGlow} strokeWidth={5} />}
-      {/* 容器主体（可拖拽） */}
-      <g onPointerDown={onDown} style={{ cursor: 'move' }}>
-        <rect x={f.x} y={f.y} width={f.w} height={f.h} rx={12} fill={n.fill} opacity={0.32}
-          stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.4} strokeDasharray="6 4" />
-        <rect x={f.x + 3} y={f.y + 3} width={f.w - 6} height={f.h - 6} rx={9} fill="none" stroke={n.stroke} strokeWidth={1} opacity={0.5} />
-        {/* 头部 */}
-        <path d={`M ${f.x + 12} ${f.y} H ${f.x + f.w - 12} A 12 12 0 0 1 ${f.x + f.w} ${f.y + 12} V ${f.y + C_HEADER} H ${f.x} V ${f.y + 12} A 12 12 0 0 1 ${f.x + 12} ${f.y} Z`}
+    <g data-el="1">
+      {selected && <rect x={pn.x - 5} y={pn.y - 5} width={pn.w + 10} height={pn.h + 10} rx={15} fill="none" stroke={th.selGlow} strokeWidth={5} />}
+      {/* 面板主体：不参与命中（透传给内部结点），仅视觉 */}
+      <rect x={pn.x} y={pn.y} width={pn.w} height={pn.h} rx={12} fill={n.fill} opacity={0.30}
+        stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.4} strokeDasharray="6 4" pointerEvents="none" />
+      <rect x={pn.x + 3} y={pn.y + 3} width={pn.w - 6} height={pn.h - 6} rx={9} fill="none" stroke={n.stroke} strokeWidth={1} opacity={0.5} pointerEvents="none" />
+      {/* 头部：拖拽手柄 + 选中 + 收纳 */}
+      <g onPointerDown={(e) => { onDownPanel(e); onSelect(); }} style={{ cursor: 'move' }}>
+        <path d={`M ${pn.x + 12} ${pn.y} H ${pn.x + pn.w - 12} A 12 12 0 0 1 ${pn.x + pn.w} ${pn.y + 12} V ${pn.y + C_HEADER} H ${pn.x} V ${pn.y + 12} A 12 12 0 0 1 ${pn.x + 12} ${pn.y} Z`}
           fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.4} />
-        <rect x={f.x + 9} y={f.y + 9} width={3} height={C_HEADER - 18} rx={1.5} fill={n.stroke} opacity={0.9} />
-        <text x={f.x + 18} y={f.y + C_HEADER / 2 + 1} dominantBaseline="middle" fontSize={12.5} fontWeight={800}
+        <rect x={pn.x + 9} y={pn.y + 9} width={3} height={C_HEADER - 18} rx={1.5} fill={n.stroke} opacity={0.9} />
+        <text x={pn.x + 18} y={pn.y + C_HEADER / 2 + 1} dominantBaseline="middle" fontSize={12.5} fontWeight={800}
           fill={th.edgeLabelText} fontFamily={FONT_STACK}>
           {n.text || '子流程'}
         </text>
-        <text x={f.x + f.w - 66} y={f.y + C_HEADER / 2 + 1} dominantBaseline="middle" fontSize={10} fontWeight={600}
+        <text x={pn.x + pn.w - 66} y={pn.y + C_HEADER / 2 + 1} dominantBaseline="middle" fontSize={10} fontWeight={600}
           fill={th.muted} fontFamily={FONT_STACK}>{innerCount} 节点</text>
       </g>
       {/* 收纳按钮 */}
       <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onCollapse(); }} data-noexport="1">
-        <circle cx={f.x + f.w - 16} cy={f.y + C_HEADER / 2} r={9} fill={n.stroke} stroke="#fff" strokeWidth={1.2} />
-        <text x={f.x + f.w - 16} y={f.y + C_HEADER / 2 + 0.5} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight={800} fill="#fff">−</text>
+        <circle cx={pn.x + pn.w - 16} cy={pn.y + C_HEADER / 2} r={9} fill={n.stroke} stroke="#fff" strokeWidth={1.2} />
+        <text x={pn.x + pn.w - 16} y={pn.y + C_HEADER / 2 + 0.5} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight={800} fill="#fff">−</text>
       </g>
+    </g>
+  );
+}
+
+/** 系绳：紧凑结点 → 其展开面板的虚线曲线 */
+function Tether({ node, panel, theme }: { node: FlatFlowNode; panel: FlatPanel; theme: 'light' | 'dark' }) {
+  const th = THEME[theme];
+  const n = node.n;
+  const nc = { x: node.x + node.w / 2, y: node.y + node.h / 2 };
+  const pc = { x: panel.x + panel.w / 2, y: panel.y + panel.h / 2 };
+  /* 面板相对结点的方位 → 取面板边缘中点 */
+  const dx = pc.x - nc.x, dy = pc.y - nc.y;
+  let px: number, py: number;
+  if (Math.abs(dy) >= Math.abs(dx)) {
+    px = Math.min(Math.max(nc.x, panel.x + 24), panel.x + panel.w - 24);
+    py = dy > 0 ? panel.y : panel.y + panel.h;
+  } else {
+    py = Math.min(Math.max(nc.y, panel.y + 24), panel.y + panel.h - 24);
+    px = dx > 0 ? panel.x : panel.x + panel.w;
+  }
+  const mx = (nc.x + px) / 2, my = (nc.y + py) / 2;
+  const d = `M ${nc.x} ${nc.y} Q ${mx + (py - nc.y) * 0.15} ${my - (px - nc.x) * 0.15}, ${px} ${py}`;
+  return (
+    <g pointerEvents="none">
+      <path d={d} fill="none" stroke={n.stroke} strokeWidth={1.6} strokeDasharray="2 6" strokeLinecap="round" opacity={0.8} />
+      <circle cx={nc.x} cy={nc.y} r={3.2} fill={n.stroke} />
+      <circle cx={px} cy={py} r={3.2} fill={n.stroke} />
     </g>
   );
 }
@@ -862,11 +907,11 @@ function SelOverlay({ box, toScreen, k, color, resizable, onResizeBegin, onResiz
 }
 
 /* ---------- 小地图 ---------- */
-function MiniMap({ bounds, view, size, theme, page, shapes, flat, onJump }: {
+function MiniMap({ bounds, view, size, theme, page, shapes, flat, panels, onJump }: {
   bounds: { x: number; y: number; w: number; h: number }; view: View; size: { w: number; h: number };
   theme: 'light' | 'dark'; page: Page;
   shapes: Map<string, { x: number; y: number; w: number; h: number }>;
-  flat: FlatFlowNode[]; onJump: (wx: number, wy: number) => void;
+  flat: FlatFlowNode[]; panels: FlatPanel[]; onJump: (wx: number, wy: number) => void;
 }) {
   const th = THEME[theme];
   const W = 150, H = 104, PAD = 10;
@@ -887,6 +932,7 @@ function MiniMap({ bounds, view, size, theme, page, shapes, flat, onJump }: {
         }}>
         {page.type === 'canvas' ? (
           <>
+            {panels.map((pn) => <rect key={'mp' + pn.id} x={ox + pn.x * k} y={oy + pn.y * k} width={Math.max(2, pn.w * k)} height={Math.max(2, pn.h * k)} rx={3} fill={pn.n.stroke} opacity={0.18} stroke={pn.n.stroke} strokeWidth={1} />)}
             {flat.map((f) => <rect key={f.n.id} x={ox + f.x * k} y={oy + f.y * k} width={Math.max(2, f.w * k)} height={Math.max(2, f.h * k)} rx={2} fill={f.n.stroke} opacity={0.7} />)}
             {page.states.map((s) => { const sh = shapes.get(s.id); if (!sh) return null; return <rect key={s.id} x={ox + sh.x * k} y={oy + sh.y * k} width={Math.max(2, sh.w * k)} height={Math.max(2, sh.h * k)} rx={2} fill={th.edge} opacity={0.8} />; })}
           </>

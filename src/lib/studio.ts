@@ -21,10 +21,11 @@ export interface FlowNode {
   id: string;
   kind: FlowKind;
   text: string;
-  x: number; y: number; w: number; h: number;   // 子流程展开时 w/h 为最小尺寸
+  x: number; y: number; w: number; h: number;   // 结点紧凑尺寸（主流程占位，展开后也不变）
   fill: string; stroke: string;
   inner?: InnerFlow;      // 仅 subprocess：内部小流程图
   expanded?: boolean;     // 仅 subprocess：是否展开
+  expandPos?: { x: number; y: number };  // 仅 subprocess：展开面板在本层坐标系的位置（记忆）
 }
 
 export interface WbShape {
@@ -96,7 +97,7 @@ const FLOW_DEFAULTS: Record<FlowKind, { w: number; h: number; text: string; fill
 export function makeFlowNode(kind: FlowKind, x: number, y: number): FlowNode {
   const d = FLOW_DEFAULTS[kind];
   const n: FlowNode = { id: nid('f'), kind, text: d.text, x, y, w: d.w, h: d.h, fill: d.fill, stroke: d.stroke };
-  if (kind === 'subprocess') { n.inner = { nodes: [], edges: [] }; n.expanded = true; }
+  if (kind === 'subprocess') { n.inner = { nodes: [], edges: [] }; n.expanded = false; }
   return n;
 }
 
@@ -114,40 +115,57 @@ export function makeWbShape(kind: WbKind, x: number, y: number): WbShape {
 
 /* ---------------- 子流程几何 ---------------- */
 
-export const C_PAD = 18;     // 容器内边距
-export const C_HEADER = 34;  // 容器头部高度
+export const C_PAD = 18;     // 面板内边距
+export const C_HEADER = 34;  // 面板头部高度
+export const PANEL_MIN_W = 260;
+export const PANEL_MIN_H = 150;
 
-/** 结点当前渲染尺寸（展开的子流程 = 内容包围盒 + 头部 + 内边距） */
-export function subprocessSize(n: FlowNode): { w: number; h: number } {
-  if (n.kind !== 'subprocess' || !n.expanded) return { w: n.w, h: n.h };
+/** 结点紧凑尺寸：子流程结点在主流程中永远只占这一小块（保证主布局稳定） */
+export function flowNodeSize(n: FlowNode): { w: number; h: number } {
+  return { w: n.w, h: n.h };
+}
+
+/** 展开面板尺寸：由内部内容包围盒 + 头部 + 内边距推得（递归计入嵌套面板） */
+export function panelSize(n: FlowNode): { w: number; h: number } {
   const inner = n.inner;
-  if (!inner || !inner.nodes.length) return { w: Math.max(n.w, 220), h: Math.max(n.h, 130) };
+  if (!inner || !inner.nodes.length) return { w: Math.max(n.w, PANEL_MIN_W), h: PANEL_MIN_H };
   let x2 = 0, y2 = 0;
   for (const k of inner.nodes) {
-    const s = subprocessSize(k);
-    x2 = Math.max(x2, k.x + s.w);
-    y2 = Math.max(y2, k.y + s.h);
+    x2 = Math.max(x2, k.x + k.w);
+    y2 = Math.max(y2, k.y + k.h);
+    if (k.kind === 'subprocess' && k.expanded && k.expandPos) {
+      const ps = panelSize(k);
+      x2 = Math.max(x2, k.expandPos.x + ps.w);
+      y2 = Math.max(y2, k.expandPos.y + ps.h);
+    }
   }
-  return { w: Math.max(n.w, x2 + C_PAD * 2), h: Math.max(n.h, y2 + C_HEADER + C_PAD) };
+  return { w: Math.max(PANEL_MIN_W, x2 + C_PAD * 2), h: Math.max(PANEL_MIN_H, y2 + C_HEADER + C_PAD) };
 }
 
 export interface FlatFlowNode { n: FlowNode; path: string[]; x: number; y: number; w: number; h: number }
 export interface FlatFlowEdge { e: FlowEdge; path: string[]; a: FlatFlowNode; b: FlatFlowNode }
+export interface FlatPanel { id: string; path: string[]; n: FlowNode; x: number; y: number; w: number; h: number }
 
-/** 递归展平：把嵌套子流程换算成世界坐标（内部坐标相对于容器内容区左上角） */
+/**
+ * 递归展平：子流程结点本体按紧凑尺寸落在原位；
+ * 展开的面板以其记忆位置 expandPos 为原点独立摆放，内部结点换算到面板内容区。
+ */
 export function flattenFlow(
   nodes: FlowNode[], edges: FlowEdge[], ox = 0, oy = 0, path: string[] = [],
-): { nodes: FlatFlowNode[]; edges: FlatFlowEdge[] } {
+): { nodes: FlatFlowNode[]; edges: FlatFlowEdge[]; panels: FlatPanel[] } {
   const flatN: FlatFlowNode[] = [];
   const flatE: FlatFlowEdge[] = [];
+  const panels: FlatPanel[] = [];
   const posMap = new Map<string, FlatFlowNode>();
   const walk = (ns: FlowNode[], es: FlowEdge[], wx: number, wy: number, p: string[]) => {
     for (const n of ns) {
-      const s = subprocessSize(n);
-      const f: FlatFlowNode = { n, path: p, x: wx + n.x, y: wy + n.y, w: s.w, h: s.h };
+      const f: FlatFlowNode = { n, path: p, x: wx + n.x, y: wy + n.y, w: n.w, h: n.h };
       flatN.push(f); posMap.set(n.id, f);
       if (n.kind === 'subprocess' && n.expanded && n.inner) {
-        walk(n.inner.nodes, n.inner.edges, f.x + C_PAD, f.y + C_HEADER, [...p, n.id]);
+        const ep = n.expandPos ?? { x: n.x + n.w + 72, y: n.y };
+        const ps = panelSize(n);
+        panels.push({ id: n.id, path: p, n, x: wx + ep.x, y: wy + ep.y, w: ps.w, h: ps.h });
+        walk(n.inner.nodes, n.inner.edges, wx + ep.x + C_PAD, wy + ep.y + C_HEADER, [...p, n.id]);
       }
     }
     for (const e of es) {
@@ -156,7 +174,7 @@ export function flattenFlow(
     }
   };
   walk(nodes, edges, ox, oy, path);
-  return { nodes: flatN, edges: flatE };
+  return { nodes: flatN, edges: flatE, panels };
 }
 
 /** 对 path 指定层级的 {nodes, edges} 做变换（path=[] 为顶层） */
@@ -208,18 +226,14 @@ export function pruneFlow(nodes: FlowNode[], edges: FlowEdge[], id: string): Inn
 const LAYER_GAP = 96;
 const NODE_GAP = 30;
 
+/**
+ * 层级布局（仅作用于传入的这一层；子流程按紧凑尺寸占位，内部位置不被改动）。
+ * 输出坐标从 (0,0) 起算 —— 对子流程内部调用时即为面板内容区坐标。
+ */
 export function layoutFlowGraph(nodes: FlowNode[], edges: FlowEdge[], dir: Dir): FlowNode[] {
   if (!nodes.length) return nodes;
-  /* 1) 先整理子流程内部（后序），展开者的存储尺寸同步为内容尺寸 */
-  const ns = nodes.map((n) => {
-    if (n.kind !== 'subprocess' || !n.inner) return n;
-    const innerNodes = layoutFlowGraph(n.inner.nodes, n.inner.edges, dir);
-    const next = { ...n, inner: { nodes: innerNodes, edges: n.inner.edges } };
-    if (n.expanded) { const s = subprocessSize(next); return { ...next, w: s.w, h: s.h }; }
-    return next;
-  });
-
-  const size = (n: FlowNode) => subprocessSize(n);
+  const ns = nodes;
+  const size = (n: FlowNode) => flowNodeSize(n);
   const ids = new Set(ns.map((n) => n.id));
   const es = edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.source !== e.target);
 
@@ -295,6 +309,96 @@ export function layoutFlowGraph(nodes: FlowNode[], edges: FlowEdge[], dir: Dir):
   });
 }
 
+/** 重排子流程内部（面板内容区坐标），不触碰面板位置 */
+export function layoutInner(n: FlowNode, dir: Dir): FlowNode {
+  if (n.kind !== 'subprocess' || !n.inner) return n;
+  return { ...n, inner: { nodes: layoutFlowGraph(n.inner.nodes, n.inner.edges, dir), edges: n.inner.edges } };
+}
+
+/**
+ * 展开/收纳子流程（画布与属性面板共用的唯一入口）。
+ * 展开：首次→内部自动布局 + 同层碰撞避让选址；再次→复用记忆位置。
+ * 收纳：仅收起，内部布局与面板位置全部保留。
+ */
+export function toggleSubInDoc(
+  nodes: FlowNode[], edges: FlowEdge[], id: string, flowDir: Dir, extraObstacles: Rect[] = [],
+): { nodes: FlowNode[]; edges: FlowEdge[] } {
+  const locate = (ns: FlowNode[], es: FlowEdge[]): { ns: FlowNode[]; n: FlowNode } | null => {
+    for (const n of ns) if (n.id === id) return { ns, n };
+    for (const n of ns) if (n.inner) {
+      const r = locate(n.inner.nodes, n.inner.edges);
+      if (r) return r;
+    }
+    return null;
+  };
+  const loc = locate(nodes, edges);
+  if (!loc || loc.n.kind !== 'subprocess') return { nodes, edges };
+  const n = loc.n;
+  if (n.expanded) {
+    return { nodes: updateFlowNode(nodes, id, { expanded: false }), edges };
+  }
+  let inner = n.inner;
+  let expandPos = n.expandPos;
+  if (!expandPos && inner && inner.nodes.length) {
+    inner = { nodes: layoutFlowGraph(inner.nodes, inner.edges, flowDir), edges: inner.edges };
+  }
+  const tmp: FlowNode = { ...n, inner, expanded: true };
+  if (!expandPos) {
+    const ps = panelSize(tmp);
+    const obstacles: Rect[] = [...extraObstacles];
+    for (const m of loc.ns) {
+      if (m.id === id) continue;
+      obstacles.push({ x: m.x, y: m.y, w: m.w, h: m.h });
+      if (m.kind === 'subprocess' && m.expanded && m.expandPos) {
+        const mps = panelSize(m);
+        obstacles.push({ x: m.expandPos.x, y: m.expandPos.y, w: mps.w, h: mps.h });
+      }
+    }
+    expandPos = computeExpandPos(n, ps.w, ps.h, obstacles, flowDir);
+  }
+  return { nodes: updateFlowNode(nodes, id, { expanded: true, inner, expandPos }), edges };
+}
+
+/* ---------------- 面板智能选址（碰撞避让） ---------------- */
+
+export interface Rect { x: number; y: number; w: number; h: number }
+const EXPAND_GAP = 72;
+
+/**
+ * 为展开面板挑选位置：优先主流程的侧向（横向流程→下/上，纵向流程→右/左），
+ * 逐个候选做碰撞检测；无空位时逐圈向外搜索。返回的坐标与结点同坐标系。
+ */
+export function computeExpandPos(
+  node: Rect, pw: number, ph: number, obstacles: Rect[], flowDir: Dir,
+): { x: number; y: number } {
+  const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
+  const horiz = flowDir === 'LR';
+  const candidates = (m: number): { x: number; y: number }[] => (horiz
+    ? [
+        { x: cx - pw / 2, y: node.y + node.h + m },   // 下方
+        { x: cx - pw / 2, y: node.y - m - ph },        // 上方
+        { x: node.x + node.w + m, y: cy - ph / 2 },    // 右
+        { x: node.x - m - pw, y: cy - ph / 2 },        // 左
+      ]
+    : [
+        { x: node.x + node.w + m, y: cy - ph / 2 },    // 右
+        { x: node.x - m - pw, y: cy - ph / 2 },        // 左
+        { x: cx - pw / 2, y: node.y + node.h + m },    // 下
+        { x: cx - pw / 2, y: node.y - m - ph },        // 上
+      ]);
+  const M = 14; // 安全边距
+  const hit = (r: Rect) => obstacles.some(
+    (o) => r.x < o.x + o.w + M && r.x + r.w + M > o.x && r.y < o.y + o.h + M && r.y + r.h + M > o.y,
+  );
+  for (const m of [EXPAND_GAP, EXPAND_GAP * 2, EXPAND_GAP * 3.2, EXPAND_GAP * 4.6, EXPAND_GAP * 6.2]) {
+    for (const c of candidates(m)) {
+      if (!hit({ x: c.x, y: c.y, w: pw, h: ph })) return { x: Math.round(c.x), y: Math.round(c.y) };
+    }
+  }
+  const fb = candidates(EXPAND_GAP)[0];
+  return { x: Math.round(fb.x), y: Math.round(fb.y) };
+}
+
 /* ---------------- 持久化 / 规范化 ---------------- */
 
 const LS_KEY = 'stateflow-studio.pages.v1';
@@ -317,7 +421,14 @@ function normalizeFlowNodes(raw: unknown): FlowNode[] {
         nodes: normalizeFlowNodes(n.inner?.nodes),
         edges: normalizeFlowEdges(n.inner?.edges),
       };
-      node.expanded = n.expanded !== false;
+      node.expanded = n.expanded === true;
+      if (n.expandPos && Number.isFinite(n.expandPos.x) && Number.isFinite(n.expandPos.y)) {
+        node.expandPos = { x: Number(n.expandPos.x), y: Number(n.expandPos.y) };
+      }
+      /* 展开但没有记忆位置：补一个默认侧向位置，避免面板叠在结点上 */
+      if (node.expanded && !node.expandPos) {
+        node.expandPos = { x: node.x + node.w + 72, y: node.y };
+      }
     }
     return node;
   });
@@ -410,7 +521,7 @@ export function sampleStudioDoc(): StudioDoc {
     { id: nid('fe'), source: dD.id, target: dE.id },
     { id: nid('fe'), source: dE.id, target: dEnd.id },
   ] };
-  eB.expanded = true;
+  eB.expanded = false;
   const topNodes = [eStart, eA, eB, eC, eEnd];
   const topEdges: FlowEdge[] = [
     { id: nid('fe'), source: eStart.id, target: eA.id },
@@ -418,8 +529,16 @@ export function sampleStudioDoc(): StudioDoc {
     { id: nid('fe'), source: eB.id, target: eC.id },
     { id: nid('fe'), source: eC.id, target: eEnd.id },
   ];
-  const laid = layoutFlowGraph(topNodes, topEdges, 'LR');
-  page.flowNodes = laid.map((n) => ({ ...n, x: n.x + 80, y: n.y + 250 }));
+  let laid = layoutFlowGraph(topNodes, topEdges, 'LR')
+    .map((n) => ({ ...n, x: n.x + 80, y: n.y + 250 }));
+  /* 展开 [[计算过程 B]]：内部自动布局 + 侧向碰撞避让选址（演示浮动面板） */
+  const bNode = laid.find((n) => n.id === eB.id)!;
+  const bLaid = layoutInner(bNode, 'LR');
+  const bPanel = panelSize(bLaid);
+  const bObs = laid.filter((n) => n.id !== eB.id).map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }));
+  const bPos = computeExpandPos(bNode, bPanel.w, bPanel.h, bObs, 'LR');
+  laid = laid.map((n) => (n.id === eB.id ? { ...bLaid, expanded: true, expandPos: bPos } : n));
+  page.flowNodes = laid;
   page.flowEdges = topEdges;
 
   /* 白板页 */
