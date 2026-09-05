@@ -416,17 +416,19 @@ export function UnifiedCanvas() {
         if (node) {
           const p = pt(e); const w = toWorld(p.x, p.y);
           const snap = settings.snapToGrid ? GRID_SNAP : 1;
-          /* 元素当前的世界左上角（保持拖拽时的抓取偏移，落点即鼠标处，无跳变） */
-          const fw = {
-            x: Math.round((node.x + (w.x - d.swx)) / snap) * snap,
-            y: Math.round((node.y + (w.y - d.swy)) / snap) * snap,
-          };
           /* 某层级路径对应的世界坐标原点：顶层=(0,0)；嵌套层=父面板内容区左上角 */
           const levelOrigin = (path: string[]) => {
             if (!path.length) return { x: 0, y: 0 };
             const parentId = path[path.length - 1];
             const pn = flat.panels.find((q) => q.id === parentId && q.path.join('/') === path.slice(0, -1).join('/'));
             return pn ? { x: pn.x + C_PAD, y: pn.y + C_HEADER } : { x: 0, y: 0 };
+          };
+          /* 元素当前的世界左上角 = 源层级原点 + 局部坐标 + 拖拽增量。
+             此前漏加源层级原点，导致从面板内拖出时落点整体偏移（层级越深偏得越远） */
+          const srcO = levelOrigin(d.path);
+          const fw = {
+            x: Math.round((srcO.x + node.x + (w.x - d.swx)) / snap) * snap,
+            y: Math.round((srcO.y + node.y + (w.y - d.swy)) / snap) * snap,
           };
           const stripLevel = (f: { nodes: FlowNode[]; edges: FlowEdge[] }) => ({
             nodes: f.nodes.filter((n) => n.id !== d.id),

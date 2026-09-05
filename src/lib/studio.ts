@@ -298,15 +298,21 @@ export function layoutFlowGraph(nodes: FlowNode[], edges: FlowEdge[], dir: Dir):
     cursorM += maxM + LAYER_GAP;
   }
 
-  /* 5) 归一化到 (0,0) 并写回坐标 */
+  /* 5) 归一化：先算出每个结点的矩形，再按整体包围盒平移到 (0,0)，
+        保证所有坐标 ≥ 0 —— 子流程内部布局不会越出面板内容区 */
   let minM = Infinity, minC = Infinity;
   placed.forEach((p) => { minM = Math.min(minM, p.m); minC = Math.min(minC, p.c); });
-  return ns.map((n) => {
+  const rects = ns.map((n) => {
     const p = placed.get(n.id)!;
     const s = size(n);
     const m = p.m - minM, c = p.c - minC - (dir === 'LR' ? s.h : s.w) / 2;
-    return dir === 'LR' ? { ...n, x: m, y: c } : { ...n, x: c, y: m };
+    return dir === 'LR'
+      ? { n, x: m, y: c, w: s.w, h: s.h }
+      : { n, x: c, y: m, w: s.w, h: s.h };
   });
+  const bx = Math.min(...rects.map((r) => r.x));
+  const by = Math.min(...rects.map((r) => r.y));
+  return rects.map((r) => ({ ...r.n, x: Math.round(r.x - bx), y: Math.round(r.y - by) }));
 }
 
 /** 重排子流程内部（面板内容区坐标），不触碰面板位置 */
@@ -418,8 +424,18 @@ function normalizeFlowNodes(raw: unknown): FlowNode[] {
       stroke: typeof n.stroke === 'string' ? n.stroke : FLOW_DEFAULTS[kind].stroke,
     };
     if (kind === 'subprocess') {
+      /* 修复旧版布局可能留下的负坐标：内部整体平移回内容区（仅当存在负值时） */
+      let innerNodes = normalizeFlowNodes(n.inner?.nodes);
+      if (innerNodes.length) {
+        const minX = Math.min(...innerNodes.map((k) => k.x));
+        const minY = Math.min(...innerNodes.map((k) => k.y));
+        if (minX < 0 || minY < 0) {
+          const dx = minX < 0 ? -minX : 0, dy = minY < 0 ? -minY : 0;
+          innerNodes = innerNodes.map((k) => ({ ...k, x: k.x + dx, y: k.y + dy }));
+        }
+      }
       node.inner = {
-        nodes: normalizeFlowNodes(n.inner?.nodes),
+        nodes: innerNodes,
         edges: normalizeFlowEdges(n.inner?.edges),
       };
       if (n.expandPos && Number.isFinite(n.expandPos.x) && Number.isFinite(n.expandPos.y)) {
