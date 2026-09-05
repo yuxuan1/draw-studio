@@ -1,38 +1,52 @@
 /* ============================================================
- * 统一画布：状态机 + 流程图 + 白板 共存于同一 SVG
- * 共享平移 / 缩放 / 网格 / 小地图 / 选择 / 拖拽 / 连线
+ * 统一画布（多页面）
+ * · 画布页：状态机 + 流程图（含可展开子流程容器），同类型自由连线
+ * · 白板页：图片 + 叠加形状
+ * · 共享：平移 / 缩放 / 网格 / 小地图 / 选择 / 拖拽 / 导出
  * ============================================================ */
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useStudio } from '../studioStore';
-import type { Sel } from '../studioStore';
-import type { ProjectDoc, ProjectState, ProjectTransition } from '../lib/core';
 import { PALETTES, THEME, GRID_SNAP, FONT_STACK, actionLines } from '../lib/core';
+import type { ProjectDoc, ProjectState, ProjectTransition } from '../lib/core';
+import type { Page } from '../lib/studio';
 import { shapesOf, computeEdgeGeoms, arrowPoints } from '../lib/geometry';
 import type { EdgeGeom } from '../lib/geometry';
 import {
-  hiddenDescendants, makeFlowNode, makeWbShape, makeSmState, nid, tidyFlow,
+  flattenFlow, mapFlowLevel, updateFlowNode, findFlowNode, layoutFlowGraph,
+  makeFlowNode, makeWbShape, makeSmState, nid, C_HEADER,
 } from '../lib/studio';
-import type { FlowNode, WbShape } from '../lib/studio';
+import type { FlowKind, FlatFlowNode, WbShape } from '../lib/studio';
 import { wrapText, BkIcon, BI } from '../lib/boardkit';
 
 interface View { x: number; y: number; k: number }
 
+interface ConnEndpoint { family: 'state' | 'flow'; id: string; path: string[]; x: number; y: number }
+
 type Drag =
   | { mode: 'pan'; sx: number; sy: number; ox: number; oy: number }
-  | { mode: 'move'; kind: 'state' | 'flow' | 'wb'; id: string; swx: number; swy: number; base: ReturnType<typeof useStudio>['doc'] }
-  | { mode: 'connect'; from: string };
+  | { mode: 'move-state'; id: string; swx: number; swy: number; base: Page }
+  | { mode: 'move-flow'; id: string; path: string[]; swx: number; swy: number; base: Page }
+  | { mode: 'move-wb'; id: string; swx: number; swy: number; base: Page }
+  | { mode: 'connect'; from: ConnEndpoint; x: number; y: number }
+  | { mode: 'wb-draw'; id: string; sx: number; sy: number };
 
 export function UnifiedCanvas() {
   const app = useStudio();
-  const { doc, set, beginBatch, endBatch, sel, setSel, tool, setTool, theme, fitSignal } = app;
+  const {
+    doc, page, updatePage, beginBatch, endBatch, sel, setSel, tool, setTool,
+    theme, fitSignal, toast,
+  } = app;
   const settings = doc.settings;
+  const th = THEME[theme];
 
   const wrapRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
-  const [view, setView] = useState<View>({ x: 60, y: 40, k: 1 });
+  const [views, setViews] = useState<Record<string, View>>({});
+  const view: View = views[page.id] ?? { x: 60, y: 40, k: 1 };
+  const setView = (v: View) => setViews((m) => ({ ...m, [page.id]: v }));
   const [size, setSize] = useState({ w: 900, h: 600 });
-  const [hoverId, setHoverId] = useState<string | null>(null);
-  const [connect, setConnect] = useState<null | { from: string; x: number; y: number }>(null);
+  const [hoverEP, setHoverEP] = useState<ConnEndpoint | null>(null);
+  const [connect, setConnect] = useState<null | { from: ConnEndpoint; x: number; y: number }>(null);
   const dragRef = useRef<Drag | null>(null);
 
   /* ---------- 尺寸监听 ---------- */
@@ -45,24 +59,18 @@ export function UnifiedCanvas() {
     return () => ro.disconnect();
   }, []);
 
-  /* ---------- 派生几何 ---------- */
+  /* ---------- 派生几何（画布页） ---------- */
   const smDoc = useMemo<ProjectDoc>(() => ({
-    version: 1, name: doc.name, settings,
-    states: doc.states,
-    transitions: doc.transitions.filter((t) => t.enabled),
-  }), [doc, settings]);
-
+    version: 1, name: page.name, settings,
+    states: page.states,
+    transitions: page.transitions.filter((t) => t.enabled),
+  }), [page, settings]);
   const shapes = useMemo(() => shapesOf(smDoc, settings), [smDoc, settings]);
   const edges = useMemo(() => computeEdgeGeoms(smDoc, settings, theme), [smDoc, settings, theme]);
-
-  const visibleFlow = useMemo(() => {
-    const hidden = new Set<string>();
-    const mark = (pid: string) => {
-      for (const k of doc.flowNodes.filter((n) => n.parentId === pid)) { hidden.add(k.id); mark(k.id); }
-    };
-    for (const c of doc.flowNodes.filter((n) => n.collapsed)) mark(c.id);
-    return new Set(doc.flowNodes.filter((n) => !hidden.has(n.id)).map((n) => n.id));
-  }, [doc.flowNodes]);
+  const flat = useMemo(
+    () => (page.type === 'canvas' ? flattenFlow(page.flowNodes, page.flowEdges) : { nodes: [] as FlatFlowNode[], edges: [] as ReturnType<typeof flattenFlow>['edges'] }),
+    [page],
+  );
 
   /* ---------- 坐标换算 ---------- */
   const pt = (e: { clientX: number; clientY: number }) => {
@@ -73,29 +81,35 @@ export function UnifiedCanvas() {
   const toScreen = (wx: number, wy: number) => ({ x: wx * view.k + view.x, y: wy * view.k + view.y });
   const capture = (e: { pointerId: number }) => svgRef.current?.setPointerCapture(e.pointerId);
 
-  /* ---------- 全局包围盒 / 适应视图 ---------- */
+  /* ---------- 包围盒 / 适应视图 ---------- */
   const bounds = useMemo(() => {
     let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
     const eat = (x: number, y: number, w: number, h: number) => {
       x1 = Math.min(x1, x); y1 = Math.min(y1, y); x2 = Math.max(x2, x + w); y2 = Math.max(y2, y + h);
     };
-    for (const s of doc.states) { const sh = shapes.get(s.id); if (sh) eat(sh.x, sh.y, sh.w, sh.h); }
-    for (const n of doc.flowNodes) eat(n.x, n.y, n.w, n.h);
-    for (const w of doc.wbShapes) eat(w.x, w.y, Math.abs(w.w), Math.max(20, Math.abs(w.h)));
+    if (page.type === 'canvas') {
+      for (const s of page.states) { const sh = shapes.get(s.id); if (sh) eat(sh.x, sh.y, sh.w, sh.h); }
+      for (const f of flat.nodes) eat(f.x, f.y, f.w, f.h);
+    } else {
+      for (const w of page.wbShapes) eat(w.x, w.y, Math.abs(w.w), Math.max(20, Math.abs(w.h)));
+    }
     if (!isFinite(x1)) return { x: 0, y: 0, w: 800, h: 500 };
     return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
-  }, [doc, shapes]);
+  }, [page, shapes, flat]);
 
   const fit = () => {
     const pad = 70;
     const k = Math.min(2, Math.max(0.15, Math.min((size.w - pad * 2) / Math.max(1, bounds.w), (size.h - pad * 2) / Math.max(1, bounds.h))));
     setView({ k, x: (size.w - bounds.w * k) / 2 - bounds.x * k, y: (size.h - bounds.h * k) / 2 - bounds.y * k });
   };
-  const firstFit = useRef(false);
-  useEffect(() => { if (!firstFit.current) { firstFit.current = true; fit(); } /* eslint-disable-next-line */ }, [size.w]);
-  useEffect(() => { if (fitSignal) fit(); /* eslint-disable-next-line */ }, [fitSignal]);
+  const firstFit = useRef<string | null>(null);
+  useEffect(() => {
+    if (firstFit.current !== page.id && size.w > 0) { firstFit.current = page.id; fit(); }
+    // eslint-disable-next-line
+  }, [size.w, page.id]);
+  useEffect(() => { if (fitSignal && size.w > 0) fit(); /* eslint-disable-next-line */ }, [fitSignal]);
 
-  /* ---------- 注册导出（克隆世界图层 → 自包含 SVG） ---------- */
+  /* ---------- 注册导出 ---------- */
   useEffect(() => {
     app.exportHandle.current = (bg) => {
       const g = svgRef.current?.querySelector('g[data-world]');
@@ -113,6 +127,35 @@ export function UnifiedCanvas() {
     return () => { app.exportHandle.current = null; };
   });
 
+  /* ---------- 命中检测（连线目标） ---------- */
+  const endpointAt = (w: { x: number; y: number }): ConnEndpoint | null => {
+    if (page.type !== 'canvas') return null;
+    for (const s of page.states) {
+      const sh = shapes.get(s.id); if (!sh) continue;
+      const hit = sh.isCircle
+        ? Math.hypot(w.x - sh.cx, w.y - sh.cy) <= sh.r + 8
+        : w.x >= sh.x - 4 && w.x <= sh.x + sh.w + 4 && w.y >= sh.y - 4 && w.y <= sh.y + sh.h + 4;
+      if (hit) return { family: 'state', id: s.id, path: [], x: sh.cx, y: sh.cy };
+    }
+    for (let i = flat.nodes.length - 1; i >= 0; i--) {
+      const f = flat.nodes[i];
+      if (w.x >= f.x - 4 && w.x <= f.x + f.w + 4 && w.y >= f.y - 4 && w.y <= f.y + f.h + 4) {
+        return { family: 'flow', id: f.n.id, path: f.path, x: f.x + f.w / 2, y: f.y + f.h / 2 };
+      }
+    }
+    return null;
+  };
+
+  const connValid = (from: ConnEndpoint, to: ConnEndpoint | null): { ok: boolean; reason?: string } => {
+    if (!to) return { ok: false };
+    if (to.id === from.id) return { ok: false };
+    if (to.family !== from.family) return { ok: false, reason: '状态机与流程图属于不同类型，不能连线' };
+    if (to.family === 'flow' && to.path.join('/') !== from.path.join('/')) {
+      return { ok: false, reason: '只能在同一层级（同一子流程内）连线' };
+    }
+    return { ok: true };
+  };
+
   /* ---------- 缩放 ---------- */
   const onWheel = (e: React.WheelEvent) => {
     const p = pt(e);
@@ -121,69 +164,82 @@ export function UnifiedCanvas() {
     setView({ k, x: p.x - wk.x * k, y: p.y - wk.y * k });
   };
 
-  /* ---------- 创建元素（工具落点） ---------- */
+  /* ---------- 工具落点 / 白板拖拽绘制 ---------- */
+  const nextSmName = () => {
+    const used = new Set(page.states.map((s) => s.name));
+    let i = page.states.filter((s) => s.kind === 'state').length + 1;
+    while (used.has(`State${i}`)) i++;
+    return `State${i}`;
+  };
+
   const place = (wx: number, wy: number) => {
-    const x = settings.snapToGrid ? Math.round(wx / GRID_SNAP) * GRID_SNAP : Math.round(wx);
-    const y = settings.snapToGrid ? Math.round(wy / GRID_SNAP) * GRID_SNAP : Math.round(wy);
-    if (tool === 'sm-state' || tool === 'sm-terminal' || tool === 'sm-junction') {
+    const snap = settings.snapToGrid ? GRID_SNAP : 1;
+    const x = Math.round(wx / snap) * snap, y = Math.round(wy / snap) * snap;
+    if (page.type === 'canvas' && tool.startsWith('sm-')) {
       const kind = tool === 'sm-terminal' ? 'terminal' : tool === 'sm-junction' ? 'junction' : 'state';
-      const name = kind === 'state' ? nextSmName() : kind === 'terminal' ? '结束' : '';
-      const s = makeSmState(kind, x, y, name);
-      set({ ...doc, states: [...doc.states, s] });
+      const s = makeSmState(kind, x, y, kind === 'state' ? nextSmName() : kind === 'terminal' ? '结束' : '');
+      updatePage((p) => ({ ...p, states: [...p.states, s] }));
       setSel({ kind: 'state', id: s.id });
-    } else if (tool.startsWith('flow-')) {
-      const shapeMap = { 'flow-rect': 'rect', 'flow-diamond': 'diamond', 'flow-stadium': 'stadium', 'flow-io': 'parallelogram' } as const;
-      const shape = shapeMap[tool as keyof typeof shapeMap];
-      const parent = sel.kind === 'flow' && sel.id ? sel.id : null;
-      const n = makeFlowNode(shape, parent ? 0 : x, parent ? 0 : y, parent);
-      const nodes = parent
-        ? doc.flowNodes.map((nn) => (nn.id === parent ? { ...nn, collapsed: false } : nn))
-        : doc.flowNodes;
-      set({ ...doc, flowNodes: tidyAfterAdd([...nodes, n]) });
+    } else if (page.type === 'canvas' && tool.startsWith('flow-')) {
+      const kindMap: Record<string, FlowKind> = {
+        'flow-start': 'start', 'flow-process': 'process', 'flow-decision': 'decision',
+        'flow-io': 'io', 'flow-subprocess': 'subprocess',
+      };
+      const n = makeFlowNode(kindMap[tool], x, y);
+      updatePage((p) => ({ ...p, flowNodes: [...p.flowNodes, n] }));
       setSel({ kind: 'flow', id: n.id });
-    } else if (tool.startsWith('wb-')) {
-      const kindMap = { 'wb-rect': 'rect', 'wb-ellipse': 'ellipse', 'wb-arrow': 'arrow', 'wb-line': 'line', 'wb-text': 'text' } as const;
-      const w = makeWbShape(kindMap[tool as keyof typeof kindMap], x, y);
-      set({ ...doc, wbShapes: [...doc.wbShapes, w] });
+    } else if (page.type === 'whiteboard' && (tool === 'wb-text')) {
+      const w = makeWbShape('text', x, y);
+      updatePage((p) => ({ ...p, wbShapes: [...p.wbShapes, w] }));
       setSel({ kind: 'wb', id: w.id });
     }
     setTool('select');
   };
 
-  const nextSmName = () => {
-    const used = new Set(doc.states.map((s) => s.name));
-    let i = doc.states.filter((s) => s.kind === 'state').length + 1;
-    while (used.has(`State${i}`)) i++;
-    return `State${i}`;
+  const startWbDraw = (e: React.PointerEvent) => {
+    const p = pt(e); const w = toWorld(p.x, p.y);
+    const kindMap = { 'wb-rect': 'rect', 'wb-ellipse': 'ellipse', 'wb-arrow': 'arrow', 'wb-line': 'line' } as const;
+    const shape = makeWbShape(kindMap[tool as keyof typeof kindMap], w.x, w.y);
+    shape.w = 2; shape.h = kindMap[tool as keyof typeof kindMap] === 'arrow' || kindMap[tool as keyof typeof kindMap] === 'line' ? 0 : 2;
+    updatePage((p) => ({ ...p, wbShapes: [...p.wbShapes, shape] }), false);
+    setSel({ kind: 'wb', id: shape.id });
+    dragRef.current = { mode: 'wb-draw', id: shape.id, sx: w.x, sy: w.y };
+    capture(e);
   };
-
-  const tidyAfterAdd = (nodes: FlowNode[]) => tidyFlow(nodes, doc.flowDirection);
 
   /* ---------- 指针手势 ---------- */
   const onSvgPointerDown = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
     const p = pt(e);
-    if (tool !== 'select') { const w = toWorld(p.x, p.y); place(w.x, w.y); return; }
+    if (tool !== 'select') {
+      if (page.type === 'whiteboard' && tool !== 'wb-text') { startWbDraw(e); return; }
+      const w = toWorld(p.x, p.y);
+      place(w.x, w.y);
+      return;
+    }
     dragRef.current = { mode: 'pan', sx: p.x, sy: p.y, ox: view.x, oy: view.y };
     capture(e);
     setSel({ kind: null, id: null });
   };
 
-  const startMove = (e: React.PointerEvent, kind: 'state' | 'flow' | 'wb', id: string) => {
+  const startMove = (e: React.PointerEvent, d: Drag) => {
     if (e.button !== 0) return;
     e.stopPropagation();
     const p = pt(e); const w = toWorld(p.x, p.y);
-    setSel({ kind, id });
+    (d as { swx?: number }).swx = w.x;
+    (d as { swy?: number }).swy = w.y;
+    if (d.mode === 'move-state') setSel({ kind: 'state', id: d.id });
+    if (d.mode === 'move-flow') setSel({ kind: 'flow', id: d.id });
+    if (d.mode === 'move-wb') setSel({ kind: 'wb', id: d.id });
     beginBatch();
-    dragRef.current = { mode: 'move', kind, id, swx: w.x, swy: w.y, base: doc };
+    dragRef.current = d;
     capture(e);
   };
 
-  const startConnect = (e: React.PointerEvent, fromId: string) => {
+  const startConnect = (e: React.PointerEvent, from: ConnEndpoint) => {
     e.stopPropagation();
-    const sh = shapes.get(fromId); if (!sh) return;
-    dragRef.current = { mode: 'connect', from: fromId };
-    setConnect({ from: fromId, x: sh.cx, y: sh.cy });
+    dragRef.current = { mode: 'connect', from, x: from.x, y: from.y };
+    setConnect({ from, x: from.x, y: from.y });
     capture(e);
   };
 
@@ -191,121 +247,190 @@ export function UnifiedCanvas() {
     const d = dragRef.current; if (!d) return;
     const p = pt(e);
     if (d.mode === 'pan') {
-      setView((v) => ({ ...v, x: d.ox + (p.x - d.sx), y: d.oy + (p.y - d.sy) }));
-    } else if (d.mode === 'move') {
+      setView({ ...view, x: d.ox + (p.x - d.sx), y: d.oy + (p.y - d.sy) });
+    } else if (d.mode === 'move-state') {
       const w = toWorld(p.x, p.y);
-      let dx = w.x - d.swx, dy = w.y - d.swy;
       const snap = settings.snapToGrid ? GRID_SNAP : 1;
-      const base = d.base;
-      if (d.kind === 'state') {
-        const orig = base.states.find((s) => s.id === d.id); if (!orig) return;
-        const nx = Math.round((orig.position.x + dx) / snap) * snap;
-        const ny = Math.round((orig.position.y + dy) / snap) * snap;
-        set({ ...base, states: base.states.map((s) => s.id === d.id ? { ...s, position: { x: nx, y: ny } } : s) }, false);
-      } else if (d.kind === 'flow') {
-        const orig = base.flowNodes.find((s) => s.id === d.id); if (!orig) return;
-        const nx = Math.round((orig.x + dx) / snap) * snap, ny = Math.round((orig.y + dy) / snap) * snap;
-        set({ ...base, flowNodes: base.flowNodes.map((s) => s.id === d.id ? { ...s, x: nx, y: ny } : s) }, false);
-      } else {
-        const orig = base.wbShapes.find((s) => s.id === d.id); if (!orig) return;
-        const nx = Math.round((orig.x + dx) / snap) * snap, ny = Math.round((orig.y + dy) / snap) * snap;
-        set({ ...base, wbShapes: base.wbShapes.map((s) => s.id === d.id ? { ...s, x: nx, y: ny } : s) }, false);
-      }
+      const orig = d.base.states.find((s) => s.id === d.id); if (!orig) return;
+      const nx = Math.round((orig.position.x + (w.x - d.swx)) / snap) * snap;
+      const ny = Math.round((orig.position.y + (w.y - d.swy)) / snap) * snap;
+      updatePage(() => ({ ...d.base, states: d.base.states.map((s) => (s.id === d.id ? { ...s, position: { x: nx, y: ny } } : s)) }), false);
+    } else if (d.mode === 'move-flow') {
+      const w = toWorld(p.x, p.y);
+      const snap = settings.snapToGrid ? GRID_SNAP : 1;
+      const r = mapFlowLevel(d.base.flowNodes, d.base.flowEdges, d.path, (f) => {
+        const orig = f.nodes.find((n) => n.id === d.id); if (!orig) return f;
+        const nx = Math.round((orig.x + (w.x - d.swx)) / snap) * snap;
+        const ny = Math.round((orig.y + (w.y - d.swy)) / snap) * snap;
+        return { ...f, nodes: f.nodes.map((n) => (n.id === d.id ? { ...n, x: nx, y: ny } : n)) };
+      });
+      updatePage(() => ({ ...d.base, flowNodes: r.nodes }), false);
+    } else if (d.mode === 'move-wb') {
+      const w = toWorld(p.x, p.y);
+      const snap = settings.snapToGrid ? GRID_SNAP : 1;
+      const orig = d.base.wbShapes.find((s) => s.id === d.id); if (!orig) return;
+      const nx = Math.round((orig.x + (w.x - d.swx)) / snap) * snap;
+      const ny = Math.round((orig.y + (w.y - d.swy)) / snap) * snap;
+      updatePage(() => ({ ...d.base, wbShapes: d.base.wbShapes.map((s) => (s.id === d.id ? { ...s, x: nx, y: ny } : s)) }), false);
     } else if (d.mode === 'connect') {
       const w = toWorld(p.x, p.y);
       setConnect({ from: d.from, x: w.x, y: w.y });
+    } else if (d.mode === 'wb-draw') {
+      const w = toWorld(p.x, p.y);
+      updatePage((pp) => ({
+        ...pp,
+        wbShapes: pp.wbShapes.map((s) => (s.id === d.id ? { ...s, w: w.x - d.sx, h: w.y - d.sy } : s)),
+      }), false);
     }
   };
 
   const onSvgPointerUp = (e: React.PointerEvent) => {
     const d = dragRef.current; dragRef.current = null;
     if (!d) return;
-    if (d.mode === 'move') endBatch();
+    if (d.mode === 'move-state' || d.mode === 'move-flow' || d.mode === 'move-wb') endBatch();
+    if (d.mode === 'wb-draw') {
+      /* 规范化负尺寸；过小给默认值 */
+      updatePage((pp) => ({
+        ...pp,
+        wbShapes: pp.wbShapes.map((s) => {
+          if (s.id !== d.id) return s;
+          let { x, y, w, h } = s;
+          if (w < 0) { x += w; w = -w; }
+          if (h < 0) { y += h; h = -h; }
+          const isLine = s.kind === 'arrow' || s.kind === 'line';
+          if (w < 12 && h < 12 && !isLine) { w = 160; h = 100; }
+          if (isLine && Math.hypot(w, h) < 12) { w = 160; h = 0; }
+          return { ...s, x, y, w, h };
+        }),
+      }));
+      setTool('select');
+    }
     if (d.mode === 'connect') {
       const p = pt(e); const w = toWorld(p.x, p.y);
-      const target = [...shapes.entries()].find(([, sh]) =>
-        !sh.isCircle
-          ? w.x >= sh.x && w.x <= sh.x + sh.w && w.y >= sh.y && w.y <= sh.y + sh.h
-          : Math.hypot(w.x - sh.cx, w.y - sh.cy) <= sh.r + 6);
-      if (target && target[0] !== d.from) {
-        const t: ProjectTransition = { id: nid('t'), source: d.from, target: target[0], enabled: true };
-        set({ ...doc, transitions: [...doc.transitions, t] });
-        setSel({ kind: 'transition', id: t.id });
+      const target = endpointAt(w);
+      const v = connValid(d.from, target);
+      if (target && v.ok) {
+        if (d.from.family === 'state') {
+          const t: ProjectTransition = { id: nid('t'), source: d.from.id, target: target.id, enabled: true };
+          updatePage((pp) => ({ ...pp, transitions: [...pp.transitions, t] }));
+          setSel({ kind: 'transition', id: t.id });
+        } else {
+          const fe = { id: nid('fe'), source: d.from.id, target: target.id };
+          const r = mapFlowLevel(page.flowNodes, page.flowEdges, d.from.path, (f) => ({ ...f, edges: [...f.edges, fe] }));
+          updatePage((pp) => ({ ...pp, flowNodes: r.nodes, flowEdges: r.edges }));
+          setSel({ kind: 'flowEdge', id: fe.id });
+        }
+      } else if (target && v.reason) {
+        toast(v.reason, 'err');
       }
       setConnect(null);
     }
   };
 
-  /* ---------- 删除选中 ---------- */
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Delete' && e.key !== 'Backspace') return;
-      const t = e.target as HTMLElement | null;
-      if (t && (t.closest('input,textarea,select') || t.isContentEditable)) return;
-      if (!sel.id || !sel.kind) return;
-      e.preventDefault();
-      deleteSel();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line
-  }, [sel, doc]);
-
-  const deleteSel = () => {
-    if (!sel.id) return;
-    if (sel.kind === 'state') {
-      const id = sel.id;
-      set({
-        ...doc,
-        states: doc.states.filter((s) => s.id !== id),
-        transitions: doc.transitions.filter((t) => t.source !== id && t.target !== id),
-      });
-    } else if (sel.kind === 'transition') {
-      set({ ...doc, transitions: doc.transitions.filter((t) => t.id !== sel.id) });
-    } else if (sel.kind === 'flow') {
-      const id = sel.id;
-      const doomed = new Set<string>([id]);
-      let grew = true;
-      while (grew) {
-        grew = false;
-        for (const n of doc.flowNodes) if (n.parentId && doomed.has(n.parentId) && !doomed.has(n.id)) { doomed.add(n.id); grew = true; }
-      }
-      set({ ...doc, flowNodes: doc.flowNodes.filter((n) => !doomed.has(n.id)) });
-    } else if (sel.kind === 'wb') {
-      set({ ...doc, wbShapes: doc.wbShapes.filter((w) => w.id !== sel.id) });
+  /* ---------- 双击：空白新建 / 子流程展开 ---------- */
+  const onDblClick = (e: React.MouseEvent) => {
+    if ((e.target as Element).closest('[data-el]')) return;
+    if (tool !== 'select') return;
+    const p = pt(e); const w = toWorld(p.x, p.y);
+    if (page.type === 'canvas') {
+      const s = makeSmState('state', Math.round(w.x), Math.round(w.y), nextSmName());
+      updatePage((pp) => ({ ...pp, states: [...pp.states, s] }));
+      setSel({ kind: 'state', id: s.id });
+    } else {
+      const t = makeWbShape('text', Math.round(w.x), Math.round(w.y));
+      updatePage((pp) => ({ ...pp, wbShapes: [...pp.wbShapes, t] }));
+      setSel({ kind: 'wb', id: t.id });
     }
-    setSel({ kind: null, id: null });
   };
 
-  /* ---------- 缩放飞线元素 ---------- */
+  const toggleSub = (id: string) => {
+    const n = findFlowNode(page.flowNodes, id);
+    if (!n || n.kind !== 'subprocess') return;
+    const willExpand = !n.expanded;
+    updatePage((p) => ({
+      ...p,
+      flowNodes: updateFlowNode(p.flowNodes, id, {
+        expanded: willExpand,
+        inner: willExpand && n.inner && n.inner.nodes.length
+          ? { ...n.inner, nodes: layoutFlowGraph(n.inner.nodes, n.inner.edges, p.flowDir) }
+          : n.inner,
+      }),
+    }));
+  };
+
+  /* ---------- 选中框 / 缩放手柄 ---------- */
+  const selFlat = useMemo(
+    () => (sel.kind === 'flow' && sel.id ? flat.nodes.find((f) => f.n.id === sel.id) ?? null : null),
+    [sel, flat],
+  );
   const resizeTarget = useMemo(() => {
-    if (sel.kind === 'wb') return doc.wbShapes.find((w) => w.id === sel.id) ?? null;
-    if (sel.kind === 'flow') return doc.flowNodes.find((n) => n.id === sel.id) ?? null;
+    if (sel.kind === 'wb') return page.wbShapes.find((w) => w.id === sel.id) ?? null;
+    if (sel.kind === 'flow') return selFlat;
     return null;
-  }, [sel, doc]);
+  }, [sel, page, selFlat]);
 
   const onResize = (dw: number, dh: number) => {
     if (!resizeTarget || !sel.id) return;
-    const wbKind = sel.kind === 'wb' ? (resizeTarget as WbShape).kind : undefined;
-    const isLine = wbKind === 'line' || wbKind === 'arrow';
-    const nw = Math.max(24, resizeTarget.w + dw / view.k);
-    const nh = Math.max(isLine ? resizeTarget.h : 24, resizeTarget.h + dh / view.k);
-    if (sel.kind === 'wb') set({ ...doc, wbShapes: doc.wbShapes.map((w) => w.id === sel.id ? { ...w, w: nw, h: nh } : w) }, false);
-    else set({ ...doc, flowNodes: doc.flowNodes.map((n) => n.id === sel.id ? { ...n, w: nw, h: nh } : n) }, false);
+    const dwW = dw / view.k, dhW = dh / view.k;
+    if (sel.kind === 'wb') {
+      const wbKind = (resizeTarget as WbShape).kind;
+      const isLine = wbKind === 'line' || wbKind === 'arrow';
+      updatePage((p) => ({
+        ...p,
+        wbShapes: p.wbShapes.map((w) => (w.id === sel.id
+          ? { ...w, w: Math.max(8, w.w + dwW), h: isLine ? w.h + dhW : Math.max(8, w.h + dhW) }
+          : w)),
+      }), false);
+    } else if (sel.kind === 'flow' && selFlat) {
+      const minW = selFlat.n.kind === 'subprocess' ? 150 : 40;
+      const minH = selFlat.n.kind === 'subprocess' ? 90 : 28;
+      const r = mapFlowLevel(page.flowNodes, page.flowEdges, selFlat.path, (f) => ({
+        ...f,
+        nodes: f.nodes.map((n) => (n.id === sel.id
+          ? { ...n, w: Math.max(minW, n.w + dwW), h: Math.max(minH, n.h + dhW) }
+          : n)),
+      }));
+      updatePage((p) => ({ ...p, flowNodes: r.nodes }), false);
+    }
   };
 
-  const th = THEME[theme];
-  const selStroke = th.sel;
-
-  /* ---------- 选中元素的世界包围盒（用于屏幕空间覆盖层） ---------- */
   const selBox = useMemo(() => {
     if (sel.kind === 'state' && sel.id) { const sh = shapes.get(sel.id); return sh ? { x: sh.x, y: sh.y, w: sh.w, h: sh.h } : null; }
-    if (sel.kind === 'flow' && sel.id) { const n = doc.flowNodes.find((x) => x.id === sel.id); return n ? { x: n.x, y: n.y, w: n.w, h: n.h } : null; }
-    if (sel.kind === 'wb' && sel.id) { const w = doc.wbShapes.find((x) => x.id === sel.id); return w ? { x: w.x, y: w.y, w: w.w, h: Math.max(10, w.h) } : null; }
+    if (sel.kind === 'flow' && selFlat) return { x: selFlat.x, y: selFlat.y, w: selFlat.w, h: selFlat.h };
+    if (sel.kind === 'wb' && sel.id) {
+      const w = page.wbShapes.find((x) => x.id === sel.id);
+      return w ? { x: Math.min(w.x, w.x + w.w), y: Math.min(w.y, w.y + w.h), w: Math.abs(w.w), h: Math.max(10, Math.abs(w.h)) } : null;
+    }
     return null;
-  }, [sel, shapes, doc]);
+  }, [sel, shapes, selFlat, page]);
 
-  const isEmpty = !doc.states.length && !doc.flowNodes.length && !doc.wbShapes.length;
+  /* ---------- 连线手柄 ---------- */
+  const handles = useMemo(() => {
+    if (page.type !== 'canvas' || tool !== 'select') return [] as ConnEndpoint[];
+    const out: ConnEndpoint[] = [];
+    const push = (ep: ConnEndpoint) => {
+      const active = (hoverEP && hoverEP.id === ep.id) || (sel.kind !== 'transition' && sel.kind !== 'flowEdge' && sel.id === ep.id);
+      if (active) out.push(ep);
+    };
+    for (const s of page.states) {
+      const sh = shapes.get(s.id); if (!sh) continue;
+      push({ family: 'state', id: s.id, path: [], x: sh.x + sh.w + 2, y: sh.cy });
+    }
+    for (const f of flat.nodes) {
+      const anchor = page.flowDir === 'LR'
+        ? { x: f.x + f.w + 2, y: f.y + f.h / 2 }
+        : { x: f.x + f.w / 2, y: f.y + f.h + 2 };
+      push({ family: 'flow', id: f.n.id, path: f.path, ...anchor });
+    }
+    return out;
+  }, [page, shapes, flat, hoverEP, sel, tool]);
+
+  const connectTarget = connect ? endpointAt({ x: connect.x, y: connect.y }) : null;
+  const connectOk = connect ? connValid(connect.from, connectTarget) : { ok: false };
+
+  const isEmpty = page.type === 'canvas'
+    ? !page.states.length && !page.flowNodes.length
+    : !page.wbShapes.length;
 
   return (
     <div ref={wrapRef} className="relative flex-1 min-w-0 overflow-hidden" style={{ background: th.canvas }}>
@@ -317,9 +442,9 @@ export function UnifiedCanvas() {
         onPointerMove={onSvgPointerMove}
         onPointerUp={onSvgPointerUp}
         onWheel={onWheel}
-        onMouseLeave={() => setHoverId(null)}
+        onDoubleClick={onDblClick}
+        onMouseLeave={() => setHoverEP(null)}
       >
-        {/* 网格 */}
         {settings.showGrid && (
           <>
             <defs>
@@ -333,90 +458,101 @@ export function UnifiedCanvas() {
         )}
 
         <g data-world="1" transform={`translate(${view.x},${view.y}) scale(${view.k})`}>
-          {/* ===== 白板层 ===== */}
-          {doc.wbShapes.map((w) => (
-            <WbShapeView key={w.id} w={w} theme={theme} selected={sel.kind === 'wb' && sel.id === w.id}
-              onDown={(e) => startMove(e, 'wb', w.id)} onSelect={() => setSel({ kind: 'wb', id: w.id })} />
-          ))}
-
-          {/* ===== 流程图层 ===== */}
-          {doc.flowNodes.filter((n) => n.parentId && visibleFlow.has(n.id) && visibleFlow.has(n.parentId!)).map((n) => {
-            const p = doc.flowNodes.find((x) => x.id === n.parentId)!;
-            return <FlowEdge key={'e' + n.id} p={p} c={n} dir={doc.flowDirection} color={th.edge} />;
-          })}
-          {doc.flowNodes.filter((n) => visibleFlow.has(n.id)).map((n) => (
-            <FlowNodeView key={n.id} n={n} nodes={doc.flowNodes} dir={doc.flowDirection} theme={theme}
-              selected={sel.kind === 'flow' && sel.id === n.id}
-              onDown={(e) => startMove(e, 'flow', n.id)}
-              onToggle={() => toggleFlow(n.id)} />
-          ))}
-
-          {/* ===== 状态机层 ===== */}
-          {edges.map((g) => (
-            <EdgeView key={g.id} g={g} theme={theme} arrowSize={settings.arrowSize}
-              selected={sel.kind === 'transition' && sel.id === g.id}
-              onSelect={() => setSel({ kind: 'transition', id: g.id })} />
-          ))}
-          {doc.states.map((s) => {
-            const sh = shapes.get(s.id); if (!sh) return null;
-            return (
-              <StateView key={s.id} s={s} sh={sh} theme={theme} showActions={settings.showActionText}
-                selected={sel.kind === 'state' && sel.id === s.id}
-                onDown={(e) => startMove(e, 'state', s.id)}
-                onHover={(h) => setHoverId(h ? s.id : null)} />
-            );
-          })}
-
-          {/* 连接手柄（悬停状态时） */}
-          {hoverId && tool === 'select' && (() => {
-            const sh = shapes.get(hoverId); if (!sh) return null;
-            return (
-              <circle cx={sh.x + sh.w + 2} cy={sh.cy} r={7 / view.k * 1} fill={selStroke}
-                stroke="#fff" strokeWidth={1.5 / view.k} style={{ cursor: 'crosshair' }}
-                onPointerDown={(e) => startConnect(e, hoverId)} />
-            );
-          })()}
-
-          {/* 连接临时线 */}
-          {connect && (() => {
-            const sh = shapes.get(connect.from); if (!sh) return null;
-            return <line x1={sh.x + sh.w} y1={sh.cy} x2={connect.x} y2={connect.y}
-              stroke={selStroke} strokeWidth={2 / view.k} strokeDasharray={`${6 / view.k} ${5 / view.k}`} />;
-          })()}
+          {page.type === 'whiteboard' ? (
+            page.wbShapes.map((w) => (
+              <WbShapeView key={w.id} w={w} theme={theme} selected={sel.kind === 'wb' && sel.id === w.id}
+                onDown={(e) => startMove(e, { mode: 'move-wb', id: w.id, swx: 0, swy: 0, base: page })} />
+            ))
+          ) : (
+            <>
+              {/* 子流程容器（底层） */}
+              {flat.nodes.filter((f) => f.n.kind === 'subprocess' && f.n.expanded).map((f) => (
+                <ContainerView key={'c' + f.n.id} f={f} theme={theme}
+                  selected={sel.kind === 'flow' && sel.id === f.n.id}
+                  onDown={(e) => startMove(e, { mode: 'move-flow', id: f.n.id, path: f.path, swx: 0, swy: 0, base: page })}
+                  onCollapse={() => toggleSub(f.n.id)}
+                  onHover={(h) => setHoverEP(h ? { family: 'flow', id: f.n.id, path: f.path, x: f.x, y: f.y } : null)} />
+              ))}
+              {/* 流程连线 */}
+              {flat.edges.map((fe) => (
+                <FlowEdgeView key={fe.e.id} fe={fe} theme={theme}
+                  selected={sel.kind === 'flowEdge' && sel.id === fe.e.id}
+                  onSelect={() => setSel({ kind: 'flowEdge', id: fe.e.id })} />
+              ))}
+              {/* 流程结点（非展开容器） */}
+              {flat.nodes.filter((f) => !(f.n.kind === 'subprocess' && f.n.expanded)).map((f) => (
+                <FlowNodeView key={f.n.id} f={f} theme={theme}
+                  selected={sel.kind === 'flow' && sel.id === f.n.id}
+                  onDown={(e) => startMove(e, { mode: 'move-flow', id: f.n.id, path: f.path, swx: 0, swy: 0, base: page })}
+                  onExpand={() => toggleSub(f.n.id)}
+                  onHover={(h) => setHoverEP(h ? { family: 'flow', id: f.n.id, path: f.path, x: f.x, y: f.y } : null)} />
+              ))}
+              {/* 状态转移 */}
+              {edges.map((g) => (
+                <EdgeView key={g.id} g={g} theme={theme} arrowSize={settings.arrowSize}
+                  selected={sel.kind === 'transition' && sel.id === g.id}
+                  onSelect={() => setSel({ kind: 'transition', id: g.id })} />
+              ))}
+              {/* 状态结点 */}
+              {page.states.map((s) => {
+                const sh = shapes.get(s.id); if (!sh) return null;
+                return (
+                  <StateView key={s.id} s={s} sh={sh} theme={theme} showActions={settings.showActionText}
+                    selected={sel.kind === 'state' && sel.id === s.id}
+                    onDown={(e) => startMove(e, { mode: 'move-state', id: s.id, swx: 0, swy: 0, base: page })}
+                    onHover={(h) => setHoverEP(h ? { family: 'state', id: s.id, path: [], x: sh.cx, y: sh.cy } : null)} />
+                );
+              })}
+              {/* 连接手柄 */}
+              {handles.map((h) => (
+                <circle key={h.family + h.id} cx={h.x} cy={h.y} r={7} fill={th.sel}
+                  stroke="#fff" strokeWidth={1.5} style={{ cursor: 'crosshair' }}
+                  data-noexport="1"
+                  onPointerDown={(e) => startConnect(e, h)} />
+              ))}
+              {/* 连线临时线 */}
+              {connect && (
+                <g data-noexport="1">
+                  <line x1={connect.from.x} y1={connect.from.y} x2={connect.x} y2={connect.y}
+                    stroke={connectTarget ? (connectOk.ok ? th.sel : '#ef4444') : th.sel}
+                    strokeWidth={2} strokeDasharray="7 5" opacity={0.9} />
+                  <circle cx={connect.x} cy={connect.y} r={4}
+                    fill={connectTarget ? (connectOk.ok ? th.sel : '#ef4444') : th.sel} />
+                </g>
+              )}
+            </>
+          )}
         </g>
 
-        {/* ===== 屏幕空间：选中框 + 缩放手柄 ===== */}
-        {selBox && sel.kind !== 'transition' && (
-          <SelOverlay box={selBox} toScreen={toScreen} k={view.k} color={selStroke}
+        {selBox && sel.kind !== 'transition' && sel.kind !== 'flowEdge' && (
+          <SelOverlay box={selBox} toScreen={toScreen} k={view.k} color={th.sel}
             resizable={!!resizeTarget} onResizeBegin={beginBatch} onResize={onResize} onResizeEnd={endBatch} />
         )}
       </svg>
 
-      {/* 空态提示 */}
       {isEmpty && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <div className="text-center px-6 py-5 rounded-2xl" style={{ background: 'color-mix(in srgb, var(--panel) 82%, transparent)', border: '1px dashed var(--border-strong)' }}>
-            <div className="text-[15px] font-bold mb-1" style={{ color: 'var(--text)' }}>空画布</div>
-            <div className="text-[12px]" style={{ color: 'var(--muted)' }}>
-              从左侧选择工具后点击画布放置元素<br />状态机 · 流程图 · 白板 共存于此
+            <div className="text-[15px] font-bold mb-1" style={{ color: 'var(--text)' }}>
+              {page.type === 'canvas' ? '空画布页' : '空白板页'}
+            </div>
+            <div className="text-[12px] leading-5" style={{ color: 'var(--muted)' }}>
+              {page.type === 'canvas'
+                ? <>双击空白新建状态 · 左侧选择工具放置流程图元素<br />悬停元素拖出圆点即可连线（同类型之间）</>
+                : <>左侧点击「插入图片」作为底图<br />再用形状工具在图片上叠加标注 · 双击空白添加文字</>}
             </div>
           </div>
         </div>
       )}
 
-      {/* 小地图 + 缩放控件 */}
-      {settings.showMiniMap && <MiniMap bounds={bounds} view={view} size={size} theme={theme}
-        doc={doc} shapes={shapes} visibleFlow={visibleFlow}
-        onJump={(wx, wy) => setView((v) => ({ ...v, x: size.w / 2 - wx * v.k, y: size.h / 2 - wy * v.k }))} />}
+      {settings.showMiniMap && (
+        <MiniMap bounds={bounds} view={view} size={size} theme={theme} page={page}
+          shapes={shapes} flat={flat.nodes}
+          onJump={(wx, wy) => setView({ ...view, x: size.w / 2 - wx * view.k, y: size.h / 2 - wy * view.k })} />
+      )}
       <ZoomCtl view={view} setView={setView} fit={fit} />
     </div>
   );
-
-  function toggleFlow(id: string) {
-    const n = doc.flowNodes.find((x) => x.id === id); if (!n) return;
-    const flipped = doc.flowNodes.map((x) => x.id === id ? { ...x, collapsed: !x.collapsed } : x);
-    set({ ...doc, flowNodes: tidyFlow(flipped, doc.flowDirection) });
-  }
 }
 
 /* ============================================================
@@ -432,7 +568,7 @@ function StateView({ s, sh, theme, showActions, selected, onDown, onHover }: {
   const pal = PALETTES[s.color][theme];
   if (s.kind === 'start') {
     return (
-      <g onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}>
+      <g data-el="1" onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}>
         {selected && <circle cx={sh.cx} cy={sh.cy} r={sh.r + 6} fill="none" stroke={th.selGlow} strokeWidth={5} />}
         <circle cx={sh.cx} cy={sh.cy} r={sh.r} fill={th.startFill} stroke={selected ? th.sel : 'none'} strokeWidth={2} />
         <circle cx={sh.cx} cy={sh.cy} r={3.5} fill={th.startDot} />
@@ -441,7 +577,7 @@ function StateView({ s, sh, theme, showActions, selected, onDown, onHover }: {
   }
   if (s.kind === 'junction') {
     return (
-      <g onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}>
+      <g data-el="1" onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}>
         {selected && <circle cx={sh.cx} cy={sh.cy} r={sh.r + 6} fill="none" stroke={th.selGlow} strokeWidth={5} />}
         <circle cx={sh.cx} cy={sh.cy} r={sh.r} fill={th.junctionFill} stroke={selected ? th.sel : th.junctionBorder} strokeWidth={selected ? 2.5 : 2} />
       </g>
@@ -449,7 +585,7 @@ function StateView({ s, sh, theme, showActions, selected, onDown, onHover }: {
   }
   const lines = actionLines(s, showActions);
   return (
-    <g onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}>
+    <g data-el="1" onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}>
       {selected && <rect x={sh.x - 4} y={sh.y - 4} width={sh.w + 8} height={sh.h + 8} rx={14} fill="none" stroke={th.selGlow} strokeWidth={5} />}
       <rect x={sh.x} y={sh.y} width={sh.w} height={sh.h} rx={11}
         fill={pal.fill} stroke={selected ? th.sel : pal.border} strokeWidth={selected ? 2.2 : 1.5} />
@@ -473,10 +609,9 @@ function EdgeView({ g, theme, arrowSize, selected, onSelect }: {
   const th = THEME[theme];
   const color = selected ? th.sel : g.color;
   return (
-    <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onSelect(); }}>
+    <g data-el="1" style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onSelect(); }}>
       {selected && <path d={g.d} fill="none" stroke={th.selGlow} strokeWidth={g.width + 6} strokeLinecap="round" />}
       <path d={g.d} fill="none" stroke={color} strokeWidth={g.width} strokeDasharray={g.dash} strokeLinecap="round" />
-      {/* 18px 命中热区 */}
       <path d={g.d} fill="none" stroke="transparent" strokeWidth={18} />
       <polygon points={arrowPoints(g.ax, g.ay, g.aa, arrowSize)} fill={color} />
       {g.lines.length > 0 && (
@@ -494,70 +629,137 @@ function EdgeView({ g, theme, arrowSize, selected, onSelect }: {
   );
 }
 
-function FlowEdge({ p, c, dir, color }: { p: FlowNode; c: FlowNode; dir: 'LR' | 'TB'; color: string }) {
-  let d: string;
-  if (dir === 'LR') {
-    const x1 = p.x + p.w, y1 = p.y + p.h / 2, x2 = c.x, y2 = c.y + c.h / 2;
-    const mx = (x1 + x2) / 2;
-    d = `M ${x1} ${y1} C ${mx} ${y1}, ${mx} ${y2}, ${x2} ${y2}`;
-  } else {
-    const x1 = p.x + p.w / 2, y1 = p.y + p.h, x2 = c.x + c.w / 2, y2 = c.y;
-    const my = (y1 + y2) / 2;
-    d = `M ${x1} ${y1} C ${x1} ${my}, ${x2} ${my}, ${x2} ${y2}`;
-  }
-  return <path d={d} fill="none" stroke={color} strokeWidth={1.6} opacity={0.75} />;
-}
-
-function flowPath(n: FlowNode): { d?: string; rect?: boolean } {
-  const { x, y, w, h } = n;
-  if (n.shape === 'diamond') {
+/* ---------- 流程结点形状路径 ---------- */
+function flowShapePath(f: FlatFlowNode): { d?: string; rect?: boolean } {
+  const { x, y, w, h } = f;
+  const n = f.n;
+  if (n.kind === 'decision') {
     return { d: `M ${x + w / 2} ${y} L ${x + w} ${y + h / 2} L ${x + w / 2} ${y + h} L ${x} ${y + h / 2} Z` };
   }
-  if (n.shape === 'stadium') {
+  if (n.kind === 'start') {
     return { d: `M ${x + h / 2} ${y} H ${x + w - h / 2} A ${h / 2} ${h / 2} 0 0 1 ${x + w - h / 2} ${y + h} H ${x + h / 2} A ${h / 2} ${h / 2} 0 0 1 ${x + h / 2} ${y} Z` };
   }
-  if (n.shape === 'parallelogram') {
+  if (n.kind === 'io') {
     const o = Math.min(20, w * 0.18);
     return { d: `M ${x + o} ${y} H ${x + w} L ${x + w - o} ${y + h} H ${x} Z` };
   }
   return { rect: true };
 }
 
-function FlowNodeView({ n, nodes, dir, theme, selected, onDown, onToggle }: {
-  n: FlowNode; nodes: FlowNode[]; dir: 'LR' | 'TB'; theme: 'light' | 'dark'; selected: boolean;
-  onDown: (e: React.PointerEvent) => void; onToggle: () => void;
+function FlowNodeView({ f, theme, selected, onDown, onExpand, onHover }: {
+  f: FlatFlowNode; theme: 'light' | 'dark'; selected: boolean;
+  onDown: (e: React.PointerEvent) => void; onExpand: () => void; onHover: (h: boolean) => void;
 }) {
   const th = THEME[theme];
-  const fp = flowPath(n);
-  const lines = wrapText(n.text || ' ', Math.max(40, n.w - 20), 12.5);
-  const hidden = n.collapsed ? hiddenDescendants(nodes, n.id) : 0;
-  const cx = n.x + n.w / 2, cy = n.y + n.h / 2;
+  const n = f.n;
+  const fp = flowShapePath(f);
+  const lines = wrapText(n.text || ' ', Math.max(40, f.w - 24), 12.5);
+  const cx = f.x + f.w / 2, cy = f.y + f.h / 2;
   const startY = cy - ((lines.length - 1) * 16) / 2;
+  const innerCount = n.inner ? n.inner.nodes.length : 0;
   return (
-    <g onPointerDown={onDown} style={{ cursor: 'move' }}>
-      {selected && (fp.rect
-        ? <rect x={n.x - 4} y={n.y - 4} width={n.w + 8} height={n.h + 8} rx={13} fill="none" stroke={th.selGlow} strokeWidth={5} />
-        : <rect x={n.x - 4} y={n.y - 4} width={n.w + 8} height={n.h + 8} rx={13} fill="none" stroke={th.selGlow} strokeWidth={5} />)}
+    <g data-el="1" onPointerDown={onDown} onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)} style={{ cursor: 'move' }}
+      onDoubleClick={(e) => { if (n.kind === 'subprocess') { e.stopPropagation(); onExpand(); } }}>
+      {selected && <rect x={f.x - 4} y={f.y - 4} width={f.w + 8} height={f.h + 8} rx={13} fill="none" stroke={th.selGlow} strokeWidth={5} />}
       {fp.rect
-        ? <rect x={n.x} y={n.y} width={n.w} height={n.h} rx={10} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} />
+        ? <rect x={f.x} y={f.y} width={f.w} height={f.h} rx={10} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} />
         : <path d={fp.d} fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.6} strokeLinejoin="round" />}
+      {n.kind === 'subprocess' && (
+        <rect x={f.x + 4} y={f.y + 4} width={f.w - 8} height={f.h - 8} rx={7} fill="none" stroke={n.stroke} strokeWidth={1.1} opacity={0.75} />
+      )}
       {lines.map((ln, i) => (
         <text key={i} x={cx} y={startY + i * 16} textAnchor="middle" dominantBaseline="middle"
           fontSize={12.5} fontWeight={600} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{ln}</text>
       ))}
-      {n.collapsed && hidden > 0 && (
-        <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onToggle(); }}>
-          {dir === 'LR'
-            ? <><circle cx={n.x + n.w + 13} cy={cy} r={9} fill={n.stroke} /><text x={n.x + n.w + 13} y={cy} textAnchor="middle" dominantBaseline="middle" fontSize={9} fontWeight={700} fill="#fff">+{hidden}</text></>
-            : <><circle cx={cx} cy={n.y + n.h + 13} r={9} fill={n.stroke} /><text x={cx} y={n.y + n.h + 13} textAnchor="middle" dominantBaseline="middle" fontSize={9} fontWeight={700} fill="#fff">+{hidden}</text></>}
+      {n.kind === 'subprocess' && (
+        <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onExpand(); }} data-noexport="1">
+          <circle cx={f.x + f.w - 2} cy={f.y + 2} r={9} fill={n.stroke} stroke="#fff" strokeWidth={1.2} />
+          <text x={f.x + f.w - 2} y={f.y + 2.5} textAnchor="middle" dominantBaseline="middle" fontSize={10} fontWeight={800} fill="#fff">
+            {innerCount > 0 ? `+${innerCount}` : '+'}
+          </text>
         </g>
       )}
-      {/* 展开/收起开关（有子级时） */}
-      {!n.collapsed && nodes.some((k) => k.parentId === n.id) && (
-        <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onToggle(); }}>
-          {dir === 'LR'
-            ? <><circle cx={n.x + n.w + 13} cy={cy} r={8} fill={th.edgeLabelBg} stroke={n.stroke} /><text x={n.x + n.w + 13} y={cy + 0.5} textAnchor="middle" dominantBaseline="middle" fontSize={10} fontWeight={700} fill={n.stroke}>−</text></>
-            : <><circle cx={cx} cy={n.y + n.h + 13} r={8} fill={th.edgeLabelBg} stroke={n.stroke} /><text x={cx} y={n.y + n.h + 13.5} textAnchor="middle" dominantBaseline="middle" fontSize={10} fontWeight={700} fill={n.stroke}>−</text></>}
+    </g>
+  );
+}
+
+function ContainerView({ f, theme, selected, onDown, onCollapse, onHover }: {
+  f: FlatFlowNode; theme: 'light' | 'dark'; selected: boolean;
+  onDown: (e: React.PointerEvent) => void; onCollapse: () => void; onHover: (h: boolean) => void;
+}) {
+  const th = THEME[theme];
+  const n = f.n;
+  const innerCount = n.inner ? n.inner.nodes.length : 0;
+  return (
+    <g data-el="1" onMouseEnter={() => onHover(true)} onMouseLeave={() => onHover(false)}>
+      {selected && <rect x={f.x - 4} y={f.y - 4} width={f.w + 8} height={f.h + 8} rx={14} fill="none" stroke={th.selGlow} strokeWidth={5} />}
+      {/* 容器主体（可拖拽） */}
+      <g onPointerDown={onDown} style={{ cursor: 'move' }}>
+        <rect x={f.x} y={f.y} width={f.w} height={f.h} rx={12} fill={n.fill} opacity={0.32}
+          stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.4} strokeDasharray="6 4" />
+        <rect x={f.x + 3} y={f.y + 3} width={f.w - 6} height={f.h - 6} rx={9} fill="none" stroke={n.stroke} strokeWidth={1} opacity={0.5} />
+        {/* 头部 */}
+        <path d={`M ${f.x + 12} ${f.y} H ${f.x + f.w - 12} A 12 12 0 0 1 ${f.x + f.w} ${f.y + 12} V ${f.y + C_HEADER} H ${f.x} V ${f.y + 12} A 12 12 0 0 1 ${f.x + 12} ${f.y} Z`}
+          fill={n.fill} stroke={selected ? th.sel : n.stroke} strokeWidth={selected ? 2.2 : 1.4} />
+        <rect x={f.x + 9} y={f.y + 9} width={3} height={C_HEADER - 18} rx={1.5} fill={n.stroke} opacity={0.9} />
+        <text x={f.x + 18} y={f.y + C_HEADER / 2 + 1} dominantBaseline="middle" fontSize={12.5} fontWeight={800}
+          fill={th.edgeLabelText} fontFamily={FONT_STACK}>
+          {n.text || '子流程'}
+        </text>
+        <text x={f.x + f.w - 66} y={f.y + C_HEADER / 2 + 1} dominantBaseline="middle" fontSize={10} fontWeight={600}
+          fill={th.muted} fontFamily={FONT_STACK}>{innerCount} 节点</text>
+      </g>
+      {/* 收纳按钮 */}
+      <g style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onCollapse(); }} data-noexport="1">
+        <circle cx={f.x + f.w - 16} cy={f.y + C_HEADER / 2} r={9} fill={n.stroke} stroke="#fff" strokeWidth={1.2} />
+        <text x={f.x + f.w - 16} y={f.y + C_HEADER / 2 + 0.5} textAnchor="middle" dominantBaseline="middle" fontSize={11} fontWeight={800} fill="#fff">−</text>
+      </g>
+    </g>
+  );
+}
+
+function FlowEdgeView({ fe, theme, selected, onSelect }: {
+  fe: { e: { id: string; source: string; target: string; label?: string }; a: FlatFlowNode; b: FlatFlowNode };
+  theme: 'light' | 'dark'; selected: boolean; onSelect: () => void;
+}) {
+  const th = THEME[theme];
+  const color = selected ? th.sel : th.edge;
+  const ac = { x: fe.a.x + fe.a.w / 2, y: fe.a.y + fe.a.h / 2 };
+  const bc = { x: fe.b.x + fe.b.w / 2, y: fe.b.y + fe.b.h / 2 };
+  const anchor = (f: FlatFlowNode, toward: { x: number; y: number }) => {
+    const cx = f.x + f.w / 2, cy = f.y + f.h / 2;
+    const dx = toward.x - cx, dy = toward.y - cy;
+    if (!dx && !dy) return { x: cx, y: cy };
+    const t = Math.min(
+      Math.abs(dx) < 1e-6 ? 1e6 : (f.w / 2) / Math.abs(dx),
+      Math.abs(dy) < 1e-6 ? 1e6 : (f.h / 2) / Math.abs(dy),
+    );
+    return { x: cx + dx * t, y: cy + dy * t };
+  };
+  const a = anchor(fe.a, bc);
+  const b = anchor(fe.b, ac);
+  const ang = Math.atan2(b.y - a.y, b.x - a.x);
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const self = fe.e.source === fe.e.target;
+  const d = self
+    ? `M ${fe.a.x + 14} ${fe.a.y} C ${fe.a.x - 34} ${fe.a.y - 60}, ${fe.a.x + fe.a.w + 34} ${fe.a.y - 60}, ${fe.a.x + fe.a.w - 14} ${fe.a.y}`
+    : `M ${a.x} ${a.y} L ${b.x} ${b.y}`;
+  const arrow = self
+    ? arrowPoints(fe.a.x + fe.a.w - 14, fe.a.y, Math.atan2(1, 0.3), 12)
+    : arrowPoints(b.x, b.y, ang, 12);
+  const label = fe.e.label;
+  return (
+    <g data-el="1" style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onSelect(); }}>
+      {selected && <path d={d} fill="none" stroke={th.selGlow} strokeWidth={7} strokeLinecap="round" />}
+      <path d={d} fill="none" stroke={color} strokeWidth={selected ? 2.2 : 1.6} />
+      <path d={d} fill="none" stroke="transparent" strokeWidth={16} />
+      <polygon points={arrow} fill={color} />
+      {label && (
+        <g>
+          <rect x={mx - (label.length * 7 + 14)} y={my - 11} width={label.length * 14 + 28} height={22} rx={7}
+            fill={th.edgeLabelBg} stroke={selected ? th.sel : th.edgeLabelBorder} strokeWidth={selected ? 1.4 : 1} />
+          <text x={mx} y={my + 1} textAnchor="middle" dominantBaseline="middle" fontSize={11}
+            fontWeight={selected ? 700 : 500} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{label}</text>
         </g>
       )}
     </g>
@@ -566,28 +768,27 @@ function FlowNodeView({ n, nodes, dir, theme, selected, onDown, onToggle }: {
 
 function WbShapeView({ w, theme, selected, onDown }: {
   w: WbShape; theme: 'light' | 'dark'; selected: boolean;
-  onDown: (e: React.PointerEvent) => void; onSelect: () => void;
+  onDown: (e: React.PointerEvent) => void;
 }) {
   const th = THEME[theme];
   const stroke = selected ? th.sel : w.stroke;
   const common = { onPointerDown: onDown, style: { cursor: 'move' as const } };
   if (w.kind === 'image') {
     return (
-      <g {...common}>
+      <g data-el="1" {...common}>
         {selected && <rect x={w.x - 4} y={w.y - 4} width={w.w + 8} height={w.h + 8} fill="none" stroke={th.selGlow} strokeWidth={5} />}
-        <image href={w.src} x={w.x} y={w.y} width={w.w} height={w.h} preserveAspectRatio="none"
-          style={{ borderRadius: 8 }} />
-        <rect x={w.x} y={w.y} width={w.w} height={w.h} fill="none" stroke={stroke} strokeWidth={selected ? 2.2 : 1.2} rx={8} />
+        <image href={w.src} x={w.x} y={w.y} width={Math.abs(w.w)} height={Math.abs(w.h)} preserveAspectRatio="none" />
+        <rect x={w.x} y={w.y} width={Math.abs(w.w)} height={Math.abs(w.h)} fill="none" stroke={stroke} strokeWidth={selected ? 2.2 : 1.2} rx={8} />
       </g>
     );
   }
   if (w.kind === 'rect') {
-    const lines = w.text ? wrapText(w.text, Math.max(30, w.w - 16), 12) : [];
+    const lines = w.text ? wrapText(w.text, Math.max(30, Math.abs(w.w) - 16), 12) : [];
     const startY = w.y + w.h / 2 - ((lines.length - 1) * 15) / 2;
     return (
-      <g {...common}>
-        {selected && <rect x={w.x - 4} y={w.y - 4} width={w.w + 8} height={w.h + 8} rx={12} fill="none" stroke={th.selGlow} strokeWidth={5} />}
-        <rect x={w.x} y={w.y} width={w.w} height={w.h} rx={9} fill={w.fill} stroke={stroke} strokeWidth={selected ? 2.2 : w.strokeWidth} />
+      <g data-el="1" {...common}>
+        {selected && <rect x={w.x - 4} y={w.y - 4} width={Math.abs(w.w) + 8} height={Math.abs(w.h) + 8} rx={12} fill="none" stroke={th.selGlow} strokeWidth={5} />}
+        <rect x={w.x} y={w.y} width={Math.abs(w.w)} height={Math.abs(w.h)} rx={9} fill={w.fill} stroke={stroke} strokeWidth={selected ? 2.2 : w.strokeWidth} />
         {lines.map((ln, i) => (
           <text key={i} x={w.x + w.w / 2} y={startY + i * 15} textAnchor="middle" dominantBaseline="middle"
             fontSize={12} fontWeight={600} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{ln}</text>
@@ -597,9 +798,9 @@ function WbShapeView({ w, theme, selected, onDown }: {
   }
   if (w.kind === 'ellipse') {
     return (
-      <g {...common}>
-        {selected && <ellipse cx={w.x + w.w / 2} cy={w.y + w.h / 2} rx={w.w / 2 + 4} ry={w.h / 2 + 4} fill="none" stroke={th.selGlow} strokeWidth={5} />}
-        <ellipse cx={w.x + w.w / 2} cy={w.y + w.h / 2} rx={w.w / 2} ry={w.h / 2} fill={w.fill} stroke={stroke} strokeWidth={selected ? 2.2 : w.strokeWidth} />
+      <g data-el="1" {...common}>
+        {selected && <ellipse cx={w.x + w.w / 2} cy={w.y + w.h / 2} rx={Math.abs(w.w) / 2 + 4} ry={Math.abs(w.h) / 2 + 4} fill="none" stroke={th.selGlow} strokeWidth={5} />}
+        <ellipse cx={w.x + w.w / 2} cy={w.y + w.h / 2} rx={Math.abs(w.w) / 2} ry={Math.abs(w.h) / 2} fill={w.fill} stroke={stroke} strokeWidth={selected ? 2.2 : w.strokeWidth} />
       </g>
     );
   }
@@ -607,18 +808,17 @@ function WbShapeView({ w, theme, selected, onDown }: {
     const x1 = w.x, y1 = w.y, x2 = w.x + w.w, y2 = w.y + w.h;
     const ang = Math.atan2(y2 - y1, x2 - x1);
     return (
-      <g {...common}>
+      <g data-el="1" {...common}>
         <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={stroke} strokeWidth={selected ? w.strokeWidth + 1 : w.strokeWidth} strokeLinecap="round" />
         {w.kind === 'arrow' && <polygon points={arrowPoints(x2, y2, ang, 14)} fill={stroke} />}
         <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="transparent" strokeWidth={16} />
       </g>
     );
   }
-  // text
-  const lines = wrapText(w.text || ' ', Math.max(30, w.w), 13);
+  const lines = wrapText(w.text || ' ', Math.max(30, Math.abs(w.w)), 13);
   return (
-    <g {...common}>
-      {selected && <rect x={w.x - 4} y={w.y - 4} width={w.w + 8} height={w.h + 8} rx={8} fill="none" stroke={th.selGlow} strokeWidth={4} />}
+    <g data-el="1" {...common}>
+      {selected && <rect x={w.x - 4} y={w.y - 4} width={Math.abs(w.w) + 8} height={Math.abs(w.h) + 8} rx={8} fill="none" stroke={th.selGlow} strokeWidth={4} />}
       {lines.map((ln, i) => (
         <text key={i} x={w.x} y={w.y + 14 + i * 17} fontSize={13} fontWeight={600} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{ln}</text>
       ))}
@@ -626,7 +826,7 @@ function WbShapeView({ w, theme, selected, onDown }: {
   );
 }
 
-/* ---------- 选中覆盖层（屏幕空间） ---------- */
+/* ---------- 选中覆盖层 ---------- */
 function SelOverlay({ box, toScreen, k, color, resizable, onResizeBegin, onResize, onResizeEnd }: {
   box: { x: number; y: number; w: number; h: number };
   toScreen: (x: number, y: number) => { x: number; y: number };
@@ -662,11 +862,11 @@ function SelOverlay({ box, toScreen, k, color, resizable, onResizeBegin, onResiz
 }
 
 /* ---------- 小地图 ---------- */
-function MiniMap({ bounds, view, size, theme, doc, shapes, visibleFlow, onJump }: {
+function MiniMap({ bounds, view, size, theme, page, shapes, flat, onJump }: {
   bounds: { x: number; y: number; w: number; h: number }; view: View; size: { w: number; h: number };
-  theme: 'light' | 'dark'; doc: ReturnType<typeof useStudio>['doc'];
+  theme: 'light' | 'dark'; page: Page;
   shapes: Map<string, { x: number; y: number; w: number; h: number }>;
-  visibleFlow: Set<string>; onJump: (wx: number, wy: number) => void;
+  flat: FlatFlowNode[]; onJump: (wx: number, wy: number) => void;
 }) {
   const th = THEME[theme];
   const W = 150, H = 104, PAD = 10;
@@ -685,9 +885,14 @@ function MiniMap({ bounds, view, size, theme, doc, shapes, visibleFlow, onJump }
           const r = e.currentTarget.getBoundingClientRect();
           onJump((e.clientX - r.left - ox) / k, (e.clientY - r.top - oy) / k);
         }}>
-        {doc.wbShapes.map((w) => <rect key={w.id} x={ox + w.x * k} y={oy + w.y * k} width={Math.max(2, w.w * k)} height={Math.max(2, w.h * k)} fill={w.stroke} opacity={0.5} />)}
-        {doc.flowNodes.filter((n) => visibleFlow.has(n.id)).map((n) => <rect key={n.id} x={ox + n.x * k} y={oy + n.y * k} width={Math.max(2, n.w * k)} height={Math.max(2, n.h * k)} rx={2} fill={n.stroke} opacity={0.7} />)}
-        {doc.states.map((s) => { const sh = shapes.get(s.id); if (!sh) return null; return <rect key={s.id} x={ox + sh.x * k} y={oy + sh.y * k} width={Math.max(2, sh.w * k)} height={Math.max(2, sh.h * k)} rx={2} fill={th.edge} opacity={0.8} />; })}
+        {page.type === 'canvas' ? (
+          <>
+            {flat.map((f) => <rect key={f.n.id} x={ox + f.x * k} y={oy + f.y * k} width={Math.max(2, f.w * k)} height={Math.max(2, f.h * k)} rx={2} fill={f.n.stroke} opacity={0.7} />)}
+            {page.states.map((s) => { const sh = shapes.get(s.id); if (!sh) return null; return <rect key={s.id} x={ox + sh.x * k} y={oy + sh.y * k} width={Math.max(2, sh.w * k)} height={Math.max(2, sh.h * k)} rx={2} fill={th.edge} opacity={0.8} />; })}
+          </>
+        ) : (
+          page.wbShapes.map((w) => <rect key={w.id} x={ox + w.x * k} y={oy + w.y * k} width={Math.max(2, Math.abs(w.w) * k)} height={Math.max(2, Math.abs(w.h) * k)} fill={w.stroke} opacity={0.5} />)
+        )}
         <rect x={vp.x} y={vp.y} width={vp.w} height={vp.h} fill="none" stroke={th.sel} strokeWidth={1.5} rx={2} />
       </svg>
     </div>
@@ -711,3 +916,5 @@ function ZoomCtl({ view, setView, fit }: { view: View; setView: (v: View) => voi
     </div>
   );
 }
+
+

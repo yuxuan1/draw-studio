@@ -1,241 +1,346 @@
 /* ============================================================
- * 顶栏（中文菜单）+ 底栏 + Toast
+ * 顶栏 + 页面页签 + 右下角新建页面 + 状态栏 + 导出/帮助弹窗 + Toast
  * ============================================================ */
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useStudio } from '../studioStore';
-import { BkIcon, BI, svgToPng, downloadBlob } from '../lib/boardkit';
 import { sanitizeFilename } from '../lib/core';
-import type { LayoutKind } from '../lib/core';
-import { runLayout } from '../lib/layout';
-import { defaultStudioDoc, sampleStudioDoc, normalizeStudio } from '../lib/studio';
+import { svgToPng, downloadBlob, BkIcon, BI } from '../lib/boardkit';
 
-function useClickOutside(onClose: () => void) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [open, setOpen] = useState(false);
-  return {
-    ref, open,
-    toggle: () => setOpen((o) => {
-      if (!o) setTimeout(() => {
-        const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) { setOpen(false); window.removeEventListener('mousedown', h); onClose(); } };
-        window.addEventListener('mousedown', h);
-      }, 0);
-      return !o;
-    }),
-    close: () => setOpen(false),
-  };
+function sv(d: string, size = 16) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d={d} />
+    </svg>
+  );
 }
 
-function Menu({ label, children }: { label: ReactNode; children: (close: () => void) => ReactNode }) {
-  const m = useClickOutside(() => {});
+const Ic = {
+  undo: sv('M8 5 3 10l5 5M3 10h11a6 6 0 0 1 6 6v1'),
+  redo: sv('m16 5 5 5-5 5M21 10H10a6 6 0 0 0-6 6v1'),
+  sun: sv('M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm0-5v2m0 14v2M3 12h2m14 0h2M5.6 5.6l1.4 1.4m10 10 1.4 1.4m0-12.8L17 7M7 17l-1.4 1.4'),
+  moon: sv('M20 13.5A8 8 0 0 1 10.5 4 8 8 0 1 0 20 13.5Z'),
+  download: sv('M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2'),
+  copy: sv('M8 8h12v12H8zM4 16V4h12'),
+  help: sv('M9 9a3 3 0 1 1 4.6 2.5c-.9.6-1.6 1.2-1.6 2.5m0 3h.01M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z'),
+  chevD: sv('m6 9 6 6 6-6', 14),
+  plus: sv('M12 5v14M5 12h14'),
+  x: sv('M6 6l12 12M18 6 6 18', 13),
+  canvas: sv('M5 4h6v5H5zM13 15h6v5h-6zM13 4h6v5h-6zM8 9v3.5a2 2 0 0 0 2 2h6'),
+  board: sv('M4 5a1 1 0 0 1 1-1h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5Zm4 10-2.5 3h13L15 13.5 12.5 16 10 13l-2 2Z'),
+};
+
+function useClickOutside(onOut: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const h = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) onOut(); };
+    window.addEventListener('mousedown', h);
+    return () => window.removeEventListener('mousedown', h);
+  }, [onOut]);
+  return ref;
+}
+
+function Drop({ label, children, width = 190 }: { label: ReactNode; children: (close: () => void) => ReactNode; width?: number }) {
+  const [open, setOpen] = useState(false);
+  const ref = useClickOutside(() => setOpen(false));
   return (
-    <div className="relative" ref={m.ref}>
-      <button className={`menu-label ${m.open ? 'open' : ''}`} onClick={m.toggle}>{label}</button>
-      {m.open && (
-        <div className="menu absolute right-0 top-[calc(100%+6px)] min-w-[172px] py-1 z-50"
-          style={{ background: 'var(--panel-2)', border: '1px solid var(--border)', borderRadius: 10, boxShadow: 'var(--shadow)' }}>
-          {children(m.close)}
+    <div className="relative" ref={ref}>
+      <button className="btn !gap-1 !py-1" onClick={() => setOpen((v) => !v)}
+        style={open ? { borderColor: 'var(--accent)', color: 'var(--accent)' } : undefined}>
+        {label}{Ic.chevD}
+      </button>
+      {open && (
+        <div className="menu-panel absolute right-0 top-[calc(100%+6px)] z-40" style={{ width }} onClick={() => setOpen(false)}>
+          {children(() => setOpen(false))}
         </div>
       )}
     </div>
   );
 }
 
-function Item({ icon, label, onClick, danger }: { icon?: string; label: string; onClick: () => void; danger?: boolean }) {
-  return (
-    <button className="menu-item" onClick={onClick} style={danger ? { color: '#e11d48' } : undefined}>
-      {icon && <BkIcon d={icon} size={14} />}
-      <span>{label}</span>
-    </button>
-  );
-}
+/* ================= 顶栏 ================= */
 
 export function TopBar() {
   const app = useStudio();
-  const { doc, set, undo, redo, canUndo, canRedo, requestFit, theme, toast, setSel, exportHandle } = app;
-  const openRef = useRef<HTMLInputElement>(null);
+  const st = app.doc.settings;
+  const nameRef = useRef<HTMLInputElement>(null);
 
-  const layoutSm = (kind: LayoutKind, close: () => void) => {
-    const smDoc = { version: 1 as const, name: doc.name, states: doc.states, transitions: doc.transitions, settings: doc.settings };
-    const posMap = runLayout(smDoc, kind, doc.settings);
-    const states = doc.states.map((s) => (posMap.has(s.id) ? { ...s, position: posMap.get(s.id)! } : s));
-    set({ ...doc, states, settings: { ...doc.settings, layout: kind } });
-    requestFit();
-    toast('状态机已重新布局');
+  const doSave = async (format: 'svg' | 'png', scale: number, close: () => void) => {
     close();
-  };
-
-  const doExport = async (format: 'png' | 'svg', scale: number, close: () => void) => {
-    close();
-    setSel({ kind: null, id: null });
+    app.setSel({ kind: null, id: null });
     await new Promise((r) => setTimeout(r, 90));
-    const res = exportHandle.current?.(format === 'svg' ? 'theme' : 'white');
-    if (!res) { toast('导出失败：画布为空', 'err'); return; }
-    const fname = sanitizeFilename(doc.name);
-    if (format === 'svg') {
-      downloadBlob(new Blob([res.svg], { type: 'image/svg+xml;charset=utf-8' }), `${fname}.svg`);
-      toast('已导出 SVG');
-    } else {
-      try {
-        const blob = await svgToPng(res.svg, res.w, res.h, scale);
-        downloadBlob(blob, `${fname}@${scale}x.png`);
-        toast(`已导出 PNG（${scale}×）`);
-      } catch { toast('导出 PNG 失败', 'err'); }
+    const h = app.exportHandle.current;
+    if (!h) { app.toast('画布尚未就绪', 'err'); return; }
+    const out = h(format === 'png' ? 'white' : 'theme');
+    if (!out) { app.toast('导出失败：画布为空', 'err'); return; }
+    const base = sanitizeFilename(app.page.name || app.doc.name);
+    try {
+      if (format === 'svg') {
+        downloadBlob(new Blob([out.svg], { type: 'image/svg+xml' }), `${base}.svg`);
+      } else {
+        const blob = await svgToPng(out.svg, out.w, out.h, scale);
+        downloadBlob(blob, `${base}@${scale}x.png`);
+      }
+      app.toast(`已导出 ${format.toUpperCase()}`);
+    } catch {
+      app.toast('导出失败，请重试', 'err');
     }
   };
 
-  const saveFile = (close: () => void) => {
-    downloadBlob(new Blob([JSON.stringify(doc, null, 2)], { type: 'application/json' }), `${sanitizeFilename(doc.name)}.smflow.json`);
-    toast('工程文件已保存');
+  const doCopy = async (close: () => void) => {
     close();
+    app.setSel({ kind: null, id: null });
+    await new Promise((r) => setTimeout(r, 90));
+    const h = app.exportHandle.current;
+    if (!h) return;
+    const out = h('white');
+    if (!out) { app.toast('画布为空', 'err'); return; }
+    try {
+      const blob = await svgToPng(out.svg, out.w, out.h, 2);
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      app.toast('已复制 2× PNG 到剪贴板');
+    } catch {
+      app.toast('复制失败，请改用导出', 'err');
+    }
   };
 
-  const onOpen = (f: File, close: () => void) => {
-    const r = new FileReader();
-    r.onload = () => {
-      try {
-        set(normalizeStudio(JSON.parse(String(r.result))));
-        toast('工程已打开');
-      } catch { toast('文件解析失败', 'err'); }
-    };
-    r.readAsText(f);
-    close();
-  };
-
-  const ib = 'icon-btn';
   return (
-    <header className="flex items-center gap-2 px-3 h-[52px] flex-none"
+    <div className="flex items-center gap-2 px-3 h-[46px] flex-none"
       style={{ background: 'var(--panel)', borderBottom: '1px solid var(--border)' }}>
       {/* 品牌 */}
-      <div className="flex items-center gap-2 pr-2" style={{ borderRight: '1px solid var(--border)' }}>
-        <svg width="26" height="26" viewBox="0 0 32 32">
-          <rect x="3" y="11" width="11" height="11" rx="3" fill="#0d9488" />
-          <rect x="18" y="4" width="11" height="9" rx="3" fill="#6366f1" />
-          <rect x="18" y="19" width="11" height="9" rx="3" fill="#f59e0b" />
-          <path d="M14 15 L18 9 M14 18 L18 23" stroke="#0d9488" strokeWidth="2" strokeLinecap="round" />
+      <div className="flex items-center gap-2 mr-1 select-none">
+        <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true">
+          <rect x="2" y="10" width="12" height="12" rx="3" fill="var(--accent)" />
+          <rect x="18" y="4" width="12" height="10" rx="3" fill="#64748b" />
+          <rect x="18" y="18" width="12" height="10" rx="3" fill="#f59e0b" />
+          <path d="M14 14 L18 9 M14 18 L18 23" stroke="var(--accent)" strokeWidth="2" />
         </svg>
         <div className="leading-none">
-          <div className="text-[13.5px] font-bold tracking-tight" style={{ color: 'var(--text)' }}>StateFlow Studio</div>
-          <div className="text-[9.5px] mt-0.5 font-semibold" style={{ color: 'var(--muted)' }}>状态机 · 流程图 · 白板</div>
+          <div className="text-[13px] font-extrabold tracking-tight" style={{ color: 'var(--text)' }}>StateFlow Studio</div>
+          <div className="text-[9px] font-semibold mt-0.5" style={{ color: 'var(--muted)' }}>状态机 · 流程图 · 白板</div>
         </div>
       </div>
 
+      <div className="w-px h-5" style={{ background: 'var(--border)' }} />
+
       {/* 工程名（内联编辑） */}
       <input
-        className="text-[13px] font-semibold px-2 py-1 rounded-md w-[168px] outline-none transition-colors focus:ring-2"
-        style={{ background: 'transparent', color: 'var(--text)', ['--tw-ring-color' as string]: 'var(--accent-soft)' }}
-        value={doc.name}
-        onChange={(e) => set({ ...doc, name: e.target.value }, false)}
-        onBlur={() => { if (!doc.name.trim()) set({ ...doc, name: '未命名画布' }); }}
-        aria-label="工程名"
+        ref={nameRef}
+        className="text-[12.5px] font-bold px-2 py-1 rounded-md w-[150px] focus:outline-none"
+        style={{ background: 'transparent', color: 'var(--text)', border: '1px solid transparent' }}
+        value={app.doc.name}
+        onChange={(e) => app.set({ ...app.doc, name: e.target.value }, false)}
+        onBlur={(e) => {
+          const v = e.target.value.trim();
+          app.set({ ...app.doc, name: v || '未命名工程' });
+          e.target.style.border = '1px solid transparent';
+        }}
+        onFocus={(e) => { e.target.style.border = '1px solid var(--accent)'; e.target.select(); }}
+        title="工程名（点击编辑）" aria-label="工程名"
       />
 
       <div className="flex items-center gap-1">
-        <button className={ib} onClick={undo} disabled={!canUndo} title="撤销 (Ctrl/⌘+Z)" aria-label="撤销"><BkIcon d={BI.undo} /></button>
-        <button className={ib} onClick={redo} disabled={!canRedo} title="重做 (Ctrl/⌘+Shift+Z)" aria-label="重做"><BkIcon d={BI.redo} /></button>
-        <button className={ib} onClick={requestFit} title="适应视图 (F)" aria-label="适应视图"><BkIcon d={BI.fit} /></button>
+        <button className="icon-btn" onClick={app.undo} disabled={!app.canUndo} title="撤销 (Ctrl/⌘+Z)" aria-label="撤销">{Ic.undo}</button>
+        <button className="icon-btn" onClick={app.redo} disabled={!app.canRedo} title="重做 (Ctrl/⌘+Shift+Z)" aria-label="重做">{Ic.redo}</button>
       </div>
 
       <div className="flex-1" />
 
-      {/* 状态机布局 */}
-      <Menu label={<span className="flex items-center gap-1.5"><BkIcon d={BI.flow} size={14} />状态机布局</span>}>
-        {(close) => (<>
-          <Item label="横向层级（LR）" onClick={() => layoutSm('LR', close)} />
-          <Item label="纵向层级（TB）" onClick={() => layoutSm('TB', close)} />
-          <Item label="环形" onClick={() => layoutSm('circle', close)} />
-          <Item label="网格" onClick={() => layoutSm('grid', close)} />
-        </>)}
-      </Menu>
-
-      {/* 文件 */}
-      <Menu label="文件">
-        {(close) => (<>
-          <Item icon={BI.plus} label="新建空白画布" onClick={() => {
-            if (window.confirm('新建将清空当前内容，确定吗？')) { set(defaultStudioDoc()); toast('已新建空白画布'); }
-            close();
-          }} />
-          <Item icon={BI.image} label="打开工程文件…" onClick={() => { openRef.current?.click(); close(); }} />
-          <Item icon={BI.download} label="保存工程文件" onClick={() => saveFile(close)} />
-          <div className="menu-sep" />
-          <Item label="载入示例工程" onClick={() => { set(sampleStudioDoc()); requestFit(); toast('已载入示例工程'); close(); }} />
-        </>)}
-      </Menu>
-      <input ref={openRef} type="file" accept=".json,application/json" className="hidden"
-        onChange={(e) => { const f = e.target.files?.[0]; if (f) onOpen(f, () => {}); e.target.value = ''; }} />
-
-      {/* 导出 */}
-      <Menu label={<span className="flex items-center gap-1.5"><BkIcon d={BI.download} size={14} />导出</span>}>
-        {(close) => (<>
-          <Item label="PNG · 1×" onClick={() => doExport('png', 1, close)} />
-          <Item label="PNG · 2×（推荐）" onClick={() => doExport('png', 2, close)} />
-          <Item label="PNG · 3×" onClick={() => doExport('png', 3, close)} />
-          <div className="menu-sep" />
-          <Item label="SVG 矢量" onClick={() => doExport('svg', 1, close)} />
-        </>)}
-      </Menu>
-
-      {/* 帮助 */}
-      <Menu label="帮助">
-        {(close) => (<>
-          <div className="px-3 py-2 text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>
-            <div className="font-bold mb-1" style={{ color: 'var(--text)' }}>快捷键</div>
-            <div>双击空白 · 放置当前工具元素</div>
-            <div>悬停状态右缘 · 拖出转移连线</div>
-            <div>Delete · 删除选中</div>
-            <div>Ctrl/⌘+Z · 撤销 · +Shift+Z 重做</div>
-            <div>F · 适应视图 · V · 选择工具</div>
-            <div>滚轮 · 缩放 · 拖空白 · 平移</div>
-          </div>
-          <div className="menu-sep" />
-          <div className="px-3 py-2 text-[11px] leading-relaxed" style={{ color: 'var(--muted)' }}>
-            <span className="font-bold" style={{ color: 'var(--text)' }}>StateFlow Studio</span> v2.0<br />
-            状态机 · 流程图 · 白板 三合一画布<br />纯前端离线可用 · 数据仅存本地
-          </div>
-          <div className="menu-sep" />
-          <Item label="知道了" onClick={close} />
-        </>)}
-      </Menu>
-
-      {/* 主题 */}
-      <button className={ib}
-        onClick={() => set({ ...doc, settings: { ...doc.settings, theme: theme === 'light' ? 'dark' : 'light' } })}
-        title={theme === 'light' ? '切换暗色主题' : '切换亮色主题'} aria-label="切换主题">
-        <BkIcon d={theme === 'light' ? BI.moon : BI.sun} />
+      <button className={`icon-btn ${st.theme === 'light' ? '' : 'on'}`}
+        onClick={() => app.set({ ...app.doc, settings: { ...st, theme: st.theme === 'light' ? 'dark' : 'light' } }, false)}
+        title={st.theme === 'light' ? '切换暗色主题' : '切换亮色主题'} aria-label="切换主题">
+        {st.theme === 'light' ? Ic.moon : Ic.sun}
       </button>
-    </header>
+
+      <Drop label="导出" width={210}>
+        {() => (
+          <>
+            <button className="menu-item" onClick={() => doSave('png', 2, () => {})}>导出 PNG（2×）</button>
+            <button className="menu-item" onClick={() => doSave('png', 4, () => {})}>导出 PNG（4× 高清）</button>
+            <button className="menu-item" onClick={() => doSave('svg', 1, () => {})}>导出 SVG 矢量</button>
+            <div className="menu-sep" />
+            <button className="menu-item" onClick={() => doCopy(() => {})}>{Ic.copy} 复制到剪贴板</button>
+          </>
+        )}
+      </Drop>
+
+      <Drop label="帮助" width={300}>
+        {(close) => (
+          <>
+            <button className="menu-item" onClick={() => { close(); }}>
+              <span className="font-bold">快捷键</span>
+            </button>
+            <div className="px-3 pb-2 text-[11px] leading-5" style={{ color: 'var(--muted)' }}>
+              <kbd>双击空白</kbd> 新建状态/文字 · <kbd>拖圆点</kbd> 连线<br />
+              <kbd>双击子流程</kbd> 展开/收纳 · <kbd>Delete</kbd> 删除选中<br />
+              <kbd>Ctrl/⌘+Z</kbd> 撤销 · <kbd>Ctrl/⌘+Shift+Z</kbd> 重做<br />
+              <kbd>F</kbd> 适应视图 · <kbd>V</kbd> 选择工具 · <kbd>Esc</kbd> 取消
+            </div>
+            <div className="menu-sep" />
+            <div className="px-3 py-2 text-[11px] leading-5" style={{ color: 'var(--muted)' }}>
+              <span className="font-bold" style={{ color: 'var(--text)' }}>关于 StateFlow Studio</span><br />
+              三合一可视化建模工具：状态机（Stateflow 风格转移标签）、流程图（可递归展开的子流程）、白板（图片 + 形状叠加）。数据自动保存在本地浏览器，无任何网络请求。
+            </div>
+          </>
+        )}
+      </Drop>
+    </div>
   );
 }
+
+/* ================= 页面页签 ================= */
+
+export function PageTabs() {
+  const app = useStudio();
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState('');
+
+  return (
+    <div className="flex items-end gap-1 px-3 pt-1.5 flex-none overflow-x-auto"
+      style={{ background: 'var(--panel)', borderBottom: '1px solid var(--border)' }}>
+      {app.doc.pages.map((p) => {
+        const active = p.id === app.doc.activePageId;
+        return (
+          <div key={p.id}
+            className="group flex items-center gap-1.5 pl-3 pr-1.5 h-[30px] rounded-t-lg text-[11.5px] font-semibold cursor-pointer select-none transition-colors"
+            style={{
+              background: active ? 'var(--app-bg)' : 'transparent',
+              color: active ? 'var(--accent)' : 'var(--muted)',
+              border: '1px solid ' + (active ? 'var(--border)' : 'transparent'),
+              borderBottom: active ? '1px solid var(--app-bg)' : 'none',
+              marginBottom: active ? -1 : 0,
+            }}
+            onClick={() => app.setActivePage(p.id)}
+            onDoubleClick={() => { setEditing(p.id); setDraft(p.name); }}
+            title="点击切换 · 双击重命名"
+          >
+            {p.type === 'canvas' ? Ic.canvas : Ic.board}
+            {editing === p.id ? (
+              <input autoFocus className="w-[80px] bg-transparent focus:outline-none font-bold"
+                style={{ color: 'var(--text)', borderBottom: '1px solid var(--accent)' }}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onBlur={() => { app.renamePage(p.id, draft); setEditing(null); }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') { app.renamePage(p.id, draft); setEditing(null); }
+                  if (e.key === 'Escape') setEditing(null);
+                }}
+                onClick={(e) => e.stopPropagation()} />
+            ) : (
+              <span>{p.name}</span>
+            )}
+            <span className="text-[9px] font-bold px-1 rounded" style={{ background: 'var(--panel)', color: 'var(--muted)' }}>
+              {p.type === 'canvas' ? '画布' : '白板'}
+            </span>
+            {app.doc.pages.length > 1 && (
+              <button
+                className="opacity-0 group-hover:opacity-100 w-4 h-4 rounded flex items-center justify-center transition-opacity hover:bg-[var(--border)]"
+                style={{ color: 'var(--muted)' }}
+                title="删除页面"
+                onClick={(e) => { e.stopPropagation(); app.deletePage(p.id); }}
+              >{Ic.x}</button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ================= 右下角新建页面 ================= */
+
+export function NewPageFab() {
+  const app = useStudio();
+  const [open, setOpen] = useState(false);
+  const ref = useClickOutside(() => setOpen(false));
+
+  return (
+    <div className="absolute right-3 bottom-[60px] z-20" ref={ref}>
+      {open && (
+        <div className="absolute bottom-[46px] right-0 w-[220px] rounded-xl overflow-hidden"
+          style={{ background: 'var(--panel-2)', border: '1px solid var(--border)', boxShadow: 'var(--shadow)' }}>
+          <div className="px-3 py-2 text-[10.5px] font-bold" style={{ color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>
+            选择新页面类型
+          </div>
+          <button className="w-full flex items-start gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-[var(--accent-soft)]"
+            onClick={() => { app.addPage('canvas'); setOpen(false); }}>
+            <span style={{ color: 'var(--accent)' }}>{Ic.canvas}</span>
+            <span>
+              <span className="block text-[12px] font-bold" style={{ color: 'var(--text)' }}>画布页</span>
+              <span className="block text-[10.5px] leading-4" style={{ color: 'var(--muted)' }}>状态机 + 流程图（含子流程），同类型元素自由连线</span>
+            </span>
+          </button>
+          <button className="w-full flex items-start gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-[var(--accent-soft)]"
+            onClick={() => { app.addPage('whiteboard'); setOpen(false); }}>
+            <span style={{ color: '#f59e0b' }}>{Ic.board}</span>
+            <span>
+              <span className="block text-[12px] font-bold" style={{ color: 'var(--text)' }}>白板页</span>
+              <span className="block text-[10.5px] leading-4" style={{ color: 'var(--muted)' }}>插入图片作底图，叠加矩形/箭头等形状标注</span>
+            </span>
+          </button>
+        </div>
+      )}
+      <button
+        className="w-10 h-10 rounded-full flex items-center justify-center transition-transform hover:scale-105 active:scale-95"
+        style={{ background: 'var(--accent)', color: '#fff', boxShadow: '0 4px 14px color-mix(in srgb, var(--accent) 45%, transparent)' }}
+        title="新建页面" aria-label="新建页面"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <BkIcon d={BI.plus} size={20} sw={2.2} />
+      </button>
+    </div>
+  );
+}
+
+/* ================= 状态栏 ================= */
 
 export function StatusBar() {
   const app = useStudio();
-  const { doc, sel } = app;
-  const selText = sel.kind && sel.id
-    ? `已选中 ${sel.kind === 'state' ? '状态' : sel.kind === 'transition' ? '转移' : sel.kind === 'flow' ? '流程节点' : '白板元素'}`
-    : '点击选中元素 · 悬停状态右缘拖出连线 · Delete 删除';
+  const { page, sel, savedAt } = app;
+  const counts = page.type === 'canvas'
+    ? `${page.states.length} 状态 · ${page.transitions.length} 转移 · ${page.flowNodes.length} 流程节点 · ${page.flowEdges.length} 连线`
+    : `${page.wbShapes.length} 个元素`;
+  const selText = sel.kind === 'state' ? '已选中：状态（可编辑；连出的线即状态转移）'
+    : sel.kind === 'transition' ? '已选中：状态转移（右侧编辑 event/条件/动作）'
+    : sel.kind === 'flow' ? '已选中：流程节点'
+    : sel.kind === 'flowEdge' ? '已选中：流程连线（右侧编辑标签）'
+    : sel.kind === 'wb' ? '已选中：白板元素'
+    : page.type === 'canvas'
+      ? '双击空白新建状态 · 悬停元素拖出圆点连线 · 双击子流程展开'
+      : '左侧插入图片 · 拖拽绘制形状 · 双击空白添加文字';
+
   return (
-    <footer className="flex items-center gap-3 px-3 h-[30px] flex-none text-[11px]"
+    <div className="flex items-center gap-3 px-3 h-[26px] flex-none text-[10.5px]"
       style={{ background: 'var(--panel)', borderTop: '1px solid var(--border)', color: 'var(--muted)' }}>
-      <span className="font-semibold" style={{ color: 'var(--text)' }}>
-        {doc.states.filter((s) => s.kind !== 'start').length} 状态 · {doc.transitions.length} 转移 · {doc.flowNodes.length} 流程 · {doc.wbShapes.length} 白板
+      <span className="font-bold flex items-center gap-1" style={{ color: 'var(--text)' }}>
+        {page.type === 'canvas' ? Ic.canvas : Ic.board} {page.name}
       </span>
-      <span className="truncate">{selText}</span>
-      <div className="flex-1" />
-      <span>工程自动保存在本地浏览器</span>
-    </footer>
+      <span style={{ color: 'var(--border-strong)' }}>|</span>
+      <span>{counts}</span>
+      <span className="flex-1" />
+      <span className="hidden md:inline">{selText}</span>
+      <span style={{ color: 'var(--border-strong)' }}>|</span>
+      <span className={savedAt ? 'save-pulse' : ''}>
+        自动保存在本地浏览器{savedAt ? ` · ${new Date(savedAt).toLocaleTimeString('zh-CN', { hour12: false })}` : ''}
+      </span>
+    </div>
   );
 }
 
+/* ================= Toast ================= */
+
 export function Toasts() {
-  const { toasts } = useStudio();
+  const app = useStudio();
   return (
-    <div className="fixed bottom-9 left-1/2 -translate-x-1/2 flex flex-col items-center gap-2 z-[100] pointer-events-none">
-      {toasts.map((t) => (
-        <div key={t.id} className="toast px-4 py-2 text-[12.5px] font-semibold"
+    <div className="fixed bottom-10 left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-2 pointer-events-none">
+      {app.toasts.map((t) => (
+        <div key={t.id} className="toast px-4 py-2 rounded-lg text-[12px] font-semibold"
           style={{
-            background: t.type === 'err' ? '#e11d48' : 'var(--text)',
-            color: t.type === 'err' ? '#fff' : 'var(--panel)',
-            borderRadius: 999, boxShadow: 'var(--shadow)',
+            background: t.type === 'err' ? '#ef4444' : t.type === 'info' ? 'var(--panel-2)' : 'var(--accent)',
+            color: t.type === 'info' ? 'var(--text)' : '#fff',
+            border: t.type === 'info' ? '1px solid var(--border)' : 'none',
+            boxShadow: 'var(--shadow)',
           }}>
           {t.msg}
         </div>
