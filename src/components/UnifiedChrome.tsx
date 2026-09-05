@@ -279,6 +279,15 @@ export function NewPageFab() {
               <span className="block text-[10.5px] leading-4" style={{ color: 'var(--muted)' }}>插入图片作底图，叠加矩形/箭头等形状标注</span>
             </span>
           </button>
+          <button className="w-full flex items-start gap-2.5 px-3 py-2.5 text-left transition-colors hover:bg-[var(--accent-soft)]"
+            style={{ borderTop: '1px solid var(--border)' }}
+            onClick={() => { app.duplicatePage(app.page.id); setOpen(false); }}>
+            <span style={{ color: 'var(--muted)' }}>{Ic.copy}</span>
+            <span>
+              <span className="block text-[12px] font-bold" style={{ color: 'var(--text)' }}>复制当前页</span>
+              <span className="block text-[10.5px] leading-4" style={{ color: 'var(--muted)' }}>以「{app.page.name}」为模板新建一页</span>
+            </span>
+          </button>
         </div>
       )}
       <button

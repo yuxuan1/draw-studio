@@ -68,7 +68,7 @@ export function nid(prefix: string): string {
 export function makePage(type: PageType, name: string): Page {
   return {
     id: nid('p'), name, type,
-    states: [], transitions: [], flowNodes: [], flowEdges: [], flowDir: 'LR',
+    states: [], transitions: [], flowNodes: [], flowEdges: [], flowDir: 'TB',
     wbShapes: [],
   };
 }
@@ -298,15 +298,21 @@ export function layoutFlowGraph(nodes: FlowNode[], edges: FlowEdge[], dir: Dir):
     cursorM += maxM + LAYER_GAP;
   }
 
-  /* 5) 归一化到 (0,0) 并写回坐标 */
+  /* 5) 归一化：先算出每个结点的矩形，再按整体包围盒平移到 (0,0)，
+        保证所有坐标 ≥ 0 —— 子流程内部布局不会越出面板内容区 */
   let minM = Infinity, minC = Infinity;
   placed.forEach((p) => { minM = Math.min(minM, p.m); minC = Math.min(minC, p.c); });
-  return ns.map((n) => {
+  const rects = ns.map((n) => {
     const p = placed.get(n.id)!;
     const s = size(n);
     const m = p.m - minM, c = p.c - minC - (dir === 'LR' ? s.h : s.w) / 2;
-    return dir === 'LR' ? { ...n, x: m, y: c } : { ...n, x: c, y: m };
+    return dir === 'LR'
+      ? { n, x: m, y: c, w: s.w, h: s.h }
+      : { n, x: c, y: m, w: s.w, h: s.h };
   });
+  const bx = Math.min(...rects.map((r) => r.x));
+  const by = Math.min(...rects.map((r) => r.y));
+  return rects.map((r) => ({ ...r.n, x: Math.round(r.x - bx), y: Math.round(r.y - by) }));
 }
 
 /** 重排子流程内部（面板内容区坐标），不触碰面板位置 */
@@ -401,7 +407,8 @@ export function computeExpandPos(
 
 /* ---------------- 持久化 / 规范化 ---------------- */
 
-const LS_KEY = 'stateflow-studio.pages.v1';
+/* v2：子流程改为侧向浮动面板模型，旧版内联展开数据不兼容，直接弃用 */
+const LS_KEY = 'stateflow-studio.pages.v2';
 const FLOW_KINDS: FlowKind[] = ['start', 'process', 'decision', 'io', 'subprocess'];
 
 function normalizeFlowNodes(raw: unknown): FlowNode[] {
@@ -417,18 +424,25 @@ function normalizeFlowNodes(raw: unknown): FlowNode[] {
       stroke: typeof n.stroke === 'string' ? n.stroke : FLOW_DEFAULTS[kind].stroke,
     };
     if (kind === 'subprocess') {
+      /* 修复旧版布局可能留下的负坐标：内部整体平移回内容区（仅当存在负值时） */
+      let innerNodes = normalizeFlowNodes(n.inner?.nodes);
+      if (innerNodes.length) {
+        const minX = Math.min(...innerNodes.map((k) => k.x));
+        const minY = Math.min(...innerNodes.map((k) => k.y));
+        if (minX < 0 || minY < 0) {
+          const dx = minX < 0 ? -minX : 0, dy = minY < 0 ? -minY : 0;
+          innerNodes = innerNodes.map((k) => ({ ...k, x: k.x + dx, y: k.y + dy }));
+        }
+      }
       node.inner = {
-        nodes: normalizeFlowNodes(n.inner?.nodes),
+        nodes: innerNodes,
         edges: normalizeFlowEdges(n.inner?.edges),
       };
-      node.expanded = n.expanded === true;
       if (n.expandPos && Number.isFinite(n.expandPos.x) && Number.isFinite(n.expandPos.y)) {
         node.expandPos = { x: Number(n.expandPos.x), y: Number(n.expandPos.y) };
       }
-      /* 展开但没有记忆位置：补一个默认侧向位置，避免面板叠在结点上 */
-      if (node.expanded && !node.expandPos) {
-        node.expandPos = { x: node.x + node.w + 72, y: node.y };
-      }
+      /* 展开状态必须有记忆位置才成立，否则视为收纳（下次展开时重新选址+内部自动布局） */
+      node.expanded = n.expanded === true && !!node.expandPos;
     }
     return node;
   });
@@ -448,7 +462,7 @@ function normalizePage(raw: unknown, i: number): Page {
   base.transitions = Array.isArray(p.transitions) ? p.transitions : [];
   base.flowNodes = normalizeFlowNodes(p.flowNodes);
   base.flowEdges = normalizeFlowEdges(p.flowEdges);
-  base.flowDir = p.flowDir === 'TB' ? 'TB' : 'LR';
+  base.flowDir = p.flowDir === 'LR' ? 'LR' : 'TB';
   base.wbShapes = Array.isArray(p.wbShapes) ? p.wbShapes : [];
   return base;
 }
@@ -529,14 +543,15 @@ export function sampleStudioDoc(): StudioDoc {
     { id: nid('fe'), source: eB.id, target: eC.id },
     { id: nid('fe'), source: eC.id, target: eEnd.id },
   ];
-  let laid = layoutFlowGraph(topNodes, topEdges, 'LR')
-    .map((n) => ({ ...n, x: n.x + 80, y: n.y + 250 }));
-  /* 展开 [[计算过程 B]]：内部自动布局 + 侧向碰撞避让选址（演示浮动面板） */
+  /* 主流程默认纵向（TB）排列 */
+  let laid = layoutFlowGraph(topNodes, topEdges, 'TB')
+    .map((n) => ({ ...n, x: n.x + 300, y: n.y + 260 }));
+  /* 展开 [[计算过程 B]]：内部自动布局 + 侧向（右/左）碰撞避让选址（演示浮动面板） */
   const bNode = laid.find((n) => n.id === eB.id)!;
-  const bLaid = layoutInner(bNode, 'LR');
+  const bLaid = layoutInner(bNode, 'TB');
   const bPanel = panelSize(bLaid);
   const bObs = laid.filter((n) => n.id !== eB.id).map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }));
-  const bPos = computeExpandPos(bNode, bPanel.w, bPanel.h, bObs, 'LR');
+  const bPos = computeExpandPos(bNode, bPanel.w, bPanel.h, bObs, 'TB');
   laid = laid.map((n) => (n.id === eB.id ? { ...bLaid, expanded: true, expandPos: bPos } : n));
   page.flowNodes = laid;
   page.flowEdges = topEdges;
