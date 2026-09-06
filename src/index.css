@@ -148,3 +148,16 @@ kbd {
 @keyframes toastIn { from { opacity: 0; transform: translateY(12px) scale(0.96); } to { opacity: 1; transform: none; } }
 .toast { animation: toastIn 0.2s ease; box-shadow: var(--shadow-pop); border: 1px solid var(--border); background: var(--panel-2); color: var(--text); }
 @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+/* 画布缩放控件 */
+.zoom-btn {
+  width: 30px; height: 28px; display: flex; align-items: center; justify-content: center;
+  border: none; background: transparent; color: var(--text); font-size: 14px; cursor: pointer;
+  transition: background 0.12s ease;
+}
+.zoom-btn:hover { background: var(--panel-2); color: var(--accent); }
+.zoom-btn + .zoom-btn { border-top: 1px solid var(--border); }
+
+/* 自动保存提示 */
+.save-pulse { animation: saveFade 2.4s ease; color: var(--accent); font-weight: 600; }
+@keyframes saveFade { 0% { opacity: 0; } 12% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0.55; } }
