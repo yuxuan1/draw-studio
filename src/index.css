@@ -161,3 +161,18 @@ kbd {
 /* 自动保存提示 */
 .save-pulse { animation: saveFade 2.4s ease; color: var(--accent); font-weight: 600; }
 @keyframes saveFade { 0% { opacity: 0; } 12% { opacity: 1; } 75% { opacity: 1; } 100% { opacity: 0.55; } }
+
+/* ---------- React Flow 主题适配 ---------- */
+.react-flow__node { font-family: "Space Grotesk", "Noto Sans SC", sans-serif; }
+.react-flow__selection {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border: 1px dashed var(--accent);
+}
+.react-flow__nodesselection-rect {
+  background: color-mix(in srgb, var(--accent) 6%, transparent);
+  border: 1px dashed var(--accent);
+}
+.react-flow__edge-path { transition: stroke 0.15s ease; }
+.react-flow__connection-path { stroke-linecap: round; }
+.react-flow__attribution { font-size: 9px; opacity: 0.7; }
+.react-flow__handle { cursor: crosshair; }
