@@ -5,10 +5,9 @@
 import { useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useScope } from '../store/scopeStore';
-import type { Tool } from '../store/scopeStore';
 import { SHAPE_COLORS, SHAPE_COLOR_ORDER, readableOn } from '../lib/core';
 import type { ShapeColorKey } from '../lib/domain';
-import { NODE_DEFAULTS, NODE_TYPE_LABEL, buildHierarchy } from '../lib/domain';
+import { NODE_DEFAULTS, NODE_TYPE_LABEL, buildHierarchy, calledBy } from '../lib/domain';
 import type { NodeType, HierarchyNode, ID, CallNode, Edge } from '../lib/domain';
 
 const sv = (d: string, s = 16) => (
@@ -21,13 +20,14 @@ const Ic = {
   proc: sv('M4 6h16v4H4zM4 14h16v4H4z'),
 };
 
-/* ================= 左侧面板 ================= */
-const PALETTE_TYPES: NodeType[] = ['start', 'action', 'decision', 'loop', 'call', 'comment', 'end'];
-
+/* ================= 左侧面板（结构大纲 + 共同调用库） ================= */
 export function LeftPanel({ open, onToggle }: { open: boolean; onToggle: () => void }) {
   const app = useScope();
-  const { tool, theme } = app;
   const [outlineOpen, setOutlineOpen] = useState(true);
+  const [libOpen, setLibOpen] = useState(true);
+  const [fnSelected, setFnSelected] = useState<ID | null>(null);
+  const [renamingFn, setRenamingFn] = useState<ID | null>(null);
+  const editable = app.mode === 'edit';
 
   if (!open) {
     return (
@@ -42,43 +42,25 @@ export function LeftPanel({ open, onToggle }: { open: boolean; onToggle: () => v
 
   const page = app.project.pages.find((p) => p.id === app.scope.pageId);
   const hierarchy = page?.rootProcessId ? buildHierarchy(app.project, page.rootProcessId) : null;
+  const refs = fnSelected ? calledBy(app.project, fnSelected) : [];
 
   return (
-    <div className="w-[196px] flex-none flex flex-col overflow-y-auto" style={{ background: 'var(--panel)', borderRight: '1px solid var(--border)' }}>
-      <div className="flex items-center justify-between px-3.5 pt-2.5 pb-1">
-        <span className="text-[10.5px] font-bold tracking-wider" style={{ color: 'var(--muted)' }}>节点库</span>
+    <div className="w-[208px] flex-none flex flex-col overflow-y-auto" style={{ background: 'var(--panel)', borderRight: '1px solid var(--border)' }}>
+      <div className="flex items-center justify-between px-3.5 pt-2.5 pb-1.5">
+        <span className="text-[10.5px] font-bold tracking-wider" style={{ color: 'var(--muted)' }}>导航</span>
         <button onClick={onToggle} title="收纳面板" aria-label="收纳面板"
           className="w-5 h-5 rounded flex items-center justify-center hover:bg-[var(--panel-2)]" style={{ color: 'var(--muted)' }}>
           {Ic.chevL}
         </button>
       </div>
 
-      {/* 节点库 */}
-      <div className="px-3 grid grid-cols-2 gap-1.5 pb-2">
-        {PALETTE_TYPES.map((t) => {
-          const d = NODE_DEFAULTS[t];
-          const { fill, stroke } = SHAPE_COLORS[d.color][theme];
-          const active = tool === t;
-          return (
-            <button key={t} onClick={() => app.setTool(active ? 'select' : (t as Tool))}
-              className="flex flex-col items-center gap-1 rounded-lg py-2 border transition-all hover:scale-[1.03] active:scale-95"
-              style={{
-                borderColor: active ? 'var(--accent)' : 'var(--border)',
-                background: active ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'var(--panel-2)',
-              }}
-              title={`点击后在画布放置「${d.label}」`}>
-              <MiniShape type={t} fill={fill} stroke={stroke} />
-              <span className="text-[10px] font-semibold" style={{ color: active ? 'var(--accent)' : 'var(--text)' }}>{d.label}</span>
-            </button>
-          );
-        })}
-      </div>
-
-      <div className="px-3.5 pb-2">
-        <button className="btn w-full justify-center" onClick={app.autoLayout} title="对当前流程自动布局（可撤销）">
-          {Ic.layout} 自动布局
-        </button>
-      </div>
+      {editable && (
+        <div className="px-3.5 pb-2">
+          <button className="btn w-full justify-center" onClick={app.autoLayout} title="对当前流程自动布局（可撤销）">
+            {Ic.layout} 自动布局
+          </button>
+        </div>
+      )}
 
       {/* 结构大纲 */}
       <div className="px-3.5 pt-1 pb-1 flex items-center justify-between">
@@ -95,21 +77,89 @@ export function LeftPanel({ open, onToggle }: { open: boolean; onToggle: () => v
         </div>
       )}
 
+      {/* 共同调用库 */}
+      <div className="px-3.5 pt-1 pb-1 flex items-center justify-between" style={{ borderTop: '1px solid var(--border)' }}>
+        <button className="flex items-center gap-1 text-[10.5px] font-bold tracking-wider" style={{ color: 'var(--muted)' }}
+          onClick={() => setLibOpen((v) => !v)}>
+          {libOpen ? Ic.chevD : Ic.chevR} 共同调用库
+        </button>
+        {editable && (
+          <button onClick={app.addFunction} title="新建公共函数" aria-label="新建公共函数"
+            className="w-5 h-5 rounded flex items-center justify-center hover:bg-[var(--panel-2)]" style={{ color: 'var(--accent)' }}>
+            {Ic.plus}
+          </button>
+        )}
+      </div>
+      {libOpen && (
+        <div className="px-2 pb-3 flex flex-col gap-1">
+          {app.project.functions.length === 0 && (
+            <div className="px-2 py-2 text-[10.5px]" style={{ color: 'var(--muted)' }}>
+              {editable ? '尚无公共函数，点 ＋ 创建' : '尚无公共函数'}
+            </div>
+          )}
+          {app.project.functions.map((f) => {
+            const active = fnSelected === f.id;
+            const n = calledBy(app.project, f.id).length;
+            return (
+              <div key={f.id} className="rounded-lg border transition-colors"
+                style={{ borderColor: active ? 'var(--accent)' : 'var(--border)', background: active ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'var(--panel-2)' }}>
+                <div className="flex items-center gap-1.5 px-2 py-1.5">
+                  {renamingFn === f.id ? (
+                    <input autoFocus defaultValue={f.name}
+                      className="field-input flex-1 min-w-0 !py-1 !text-[11px]"
+                      onBlur={(e) => { const v = e.target.value.trim(); if (v) app.renameFunction(f.id, v); setRenamingFn(null); }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') { const v = (e.target as HTMLInputElement).value.trim(); if (v) app.renameFunction(f.id, v); setRenamingFn(null); }
+                        if (e.key === 'Escape') setRenamingFn(null);
+                      }} />
+                  ) : (
+                    <button className="flex-1 text-left min-w-0" onClick={() => setFnSelected(active ? null : f.id)}
+                      title="点击查看引用位置（called-by）">
+                      <div className="text-[11.5px] font-bold truncate" style={{ color: active ? 'var(--accent)' : 'var(--text)' }}>{f.name}</div>
+                      <div className="text-[9.5px]" style={{ color: 'var(--muted)' }}>
+                        {f.type === 'shared' ? '公共' : f.type === 'library' ? '库' : f.type === 'external' ? '外部' : '本地'} · {n} 处引用
+                      </div>
+                    </button>
+                  )}
+                  {editable && (
+                    <>
+                      <button onClick={() => setRenamingFn(f.id)} title="重命名" aria-label="重命名函数"
+                        className="w-5 h-5 rounded flex items-center justify-center hover:bg-[var(--panel)]" style={{ color: 'var(--muted)' }}>
+                        <svg width={12} height={12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round"><path d="M17 3l4 4L8 20l-5 1 1-5L17 3z" /></svg>
+                      </button>
+                      <button onClick={() => app.deleteFunction(f.id)} title="删除（被引用时不可删）" aria-label="删除函数"
+                        className="w-5 h-5 rounded flex items-center justify-center hover:bg-[var(--panel)]" style={{ color: 'var(--muted)' }}>
+                        {Ic.trash}
+                      </button>
+                    </>
+                  )}
+                </div>
+                {active && (
+                  <div className="px-2 pb-1.5 flex flex-col gap-0.5" style={{ borderTop: '1px solid var(--border)' }}>
+                    <div className="text-[9.5px] font-bold pt-1.5 pb-0.5" style={{ color: 'var(--muted)' }}>引用位置（called-by）</div>
+                    {refs.length === 0 && <div className="text-[10.5px] py-1" style={{ color: 'var(--muted)' }}>暂无引用</div>}
+                    {refs.map((r) => (
+                      <button key={r.nodeId} onClick={() => { app.enterScope(r.processId); app.setSel({ kind: 'node', ids: [r.nodeId] }); }}
+                        className="text-left px-1.5 py-1 rounded text-[10.5px] transition-colors hover:bg-[var(--panel)]"
+                        style={{ color: 'var(--text)' }}
+                        title="跳转到引用处">
+                        <span style={{ color: 'var(--accent)' }}>{r.nodeName}</span>
+                        <span style={{ color: 'var(--muted)' }}> ← {r.processName}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       <div className="mt-auto p-3.5 text-[10px] leading-4" style={{ color: 'var(--muted)' }}>
-        双击「调用」进入子流程<br />单击「调用」预览 · 面包屑返回
+        双击「调用」进入子流程<br />按 P 键在鼠标处插入节点
       </div>
     </div>
   );
-}
-
-function MiniShape({ type, fill, stroke }: { type: NodeType; fill: string; stroke: string }) {
-  if (type === 'decision' || type === 'choice') {
-    return <svg width={34} height={22} viewBox="0 0 34 22"><path d="M17 1 L33 11 L17 21 L1 11 Z" fill={fill} stroke={stroke} strokeWidth={1.4} /></svg>;
-  }
-  if (type === 'start' || type === 'end') {
-    return <svg width={34} height={20} viewBox="0 0 34 20"><rect x={1} y={2} width={32} height={16} rx={8} fill={fill} stroke={stroke} strokeWidth={1.4} /></svg>;
-  }
-  return <svg width={34} height={20} viewBox="0 0 34 20"><rect x={1} y={2} width={32} height={16} rx={4} fill={fill} stroke={stroke} strokeWidth={1.4} strokeDasharray={type === 'comment' ? '3 2' : undefined} /></svg>;
 }
 
 function OutlineTree({ node, depth, currentId }: { node: HierarchyNode; depth: number; currentId?: ID }) {

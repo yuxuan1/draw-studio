@@ -380,12 +380,15 @@ export function ScopeProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener('pointermove', onMove);
   }, []);
   const screenToWorldRef = useRef<ScopeCtx['screenToWorldRef']['current']>(null);
+  /** 按下 P 键瞬间的鼠标屏幕坐标（放置节点时使用，而非点击面板时的位置） */
+  const paletteAnchorRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
   /* ---------- P 键形状选择面板 ---------- */
   const [palette, setPalette] = useState<PaletteState>({ open: false, x: 0, y: 0, step: null });
   const openPalette = useCallback(() => {
     if (modeRef.current === 'read') { toast('阅读模式下不能添加节点', 'err'); return; }
     const m = mouseRef.current;
+    paletteAnchorRef.current = { x: m.x, y: m.y };
     /* 防止面板溢出屏幕边缘 */
     const x = Math.min(m.x + 14, window.innerWidth - 260);
     const y = Math.min(m.y + 10, window.innerHeight - 380);
@@ -398,7 +401,7 @@ export function ScopeProvider({ children }: { children: ReactNode }) {
   const placeNode = useCallback((type: NodeType, opts?: { targetProcessId?: ID; functionId?: ID }) => {
     const pid = currentProcessId; if (!pid) return;
     const conv = screenToWorldRef.current;
-    const m = mouseRef.current;
+    const m = paletteAnchorRef.current;
     const w = conv ? conv(m.x, m.y) : { x: 200, y: 200 };
     const d = NODE_DEFAULTS[type];
     const extra: Record<string, unknown> = {};
