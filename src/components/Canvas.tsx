@@ -2,14 +2,14 @@
  * Canvas —— 统一画布：状态机 + 流程图（子流程浮动面板）+ 白板
  * 所有颜色按当前主题解析（theme-aware），文字用亮度对比保证可读。
  * ============================================================ */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { useStudio } from '../store';
 import type { Tool } from '../store';
 import {
   THEME, PALETTES, GRID_SNAP, FONT_STACK, START_ID,
-  actionLines, nodeSize, readableOn, resolveShapeColor, ensureStartNode, makeSmState,
+  actionLines, nodeSize, readableOn, resolveShapeColor, ensureStartNode, makeSmState, estWidth,
 } from '../lib/core';
-import type { ProjectState, ProjectTransition, FlowNode, WbShape } from '../lib/core';
+import type { ProjectState, ProjectTransition, FlowNode, FlowEdge, WbShape, FlowEdgeStyle } from '../lib/core';
 import { shapesOf, computeEdgeGeoms, arrowPoints, bendFromPoint } from '../lib/geometry';
 import type { EdgeGeom, NodeShape } from '../lib/geometry';
 import {
@@ -457,19 +457,42 @@ export function Canvas() {
             ))
           ) : (
             <>
-              {/* 子流程面板（先画，位于底层） */}
-              {flat.panels.map((pn) => (
-                <PanelView key={'pn' + pn.id} pn={pn} theme={theme}
-                  selected={sel.kind === 'flow' && sel.id === pn.id}
-                  glow={hoverTarget !== null && hoverTarget.id === pn.id}
-                  onDownPanel={(e) => { const wpt = pt(e); const ww = toWorld(wpt.x, wpt.y); startMove(e, { mode: 'move-panel', id: pn.id, swx: ww.x, swy: ww.y, base: page }); }}
-                  onSelect={() => setSel({ kind: 'flow', id: pn.id })}
-                  onCollapse={() => toggleSub(pn.id)} />
-              ))}
+              {/* 子流程面板（先画，位于底层）+ 结点到面板的虚线系绳 */}
+              {flat.panels.map((pn) => {
+                const anchor = flat.nodes.find((f) => f.n.id === pn.id);
+                const th = THEME[theme];
+                let tether: React.ReactNode = null;
+                if (anchor) {
+                  const ncx = anchor.x + anchor.w / 2, ncy = anchor.y + anchor.h / 2;
+                  const pcx = pn.x + pn.w / 2, pcy = pn.y + pn.h / 2;
+                  const tdx = pcx - ncx, tdy = pcy - ncy;
+                  const tx = Math.abs(tdx) >= Math.abs(tdy) ? (tdx >= 0 ? pn.x : pn.x + pn.w) : pcx;
+                  const ty = Math.abs(tdx) >= Math.abs(tdy) ? pcy : (tdy >= 0 ? pn.y : pn.y + pn.h);
+                  tether = (
+                    <g pointerEvents="none">
+                      <line x1={ncx} y1={ncy} x2={tx} y2={ty} stroke={th.tether} strokeWidth={1.5} strokeDasharray="5 4" strokeLinecap="round" />
+                      <circle cx={ncx} cy={ncy} r={2.6} fill={th.tether} />
+                      <circle cx={tx} cy={ty} r={2.6} fill={th.tether} />
+                    </g>
+                  );
+                }
+                return (
+                  <Fragment key={'pn' + pn.id}>
+                    {tether}
+                    <PanelView pn={pn} theme={theme}
+                      selected={sel.kind === 'flow' && sel.id === pn.id}
+                      glow={hoverTarget !== null && hoverTarget.id === pn.id}
+                      onDownPanel={(e) => { const wpt = pt(e); const ww = toWorld(wpt.x, wpt.y); startMove(e, { mode: 'move-panel', id: pn.id, swx: ww.x, swy: ww.y, base: page }); }}
+                      onSelect={() => setSel({ kind: 'flow', id: pn.id })}
+                      onCollapse={() => toggleSub(pn.id)} />
+                  </Fragment>
+                );
+              })}
               {/* 流程连线 */}
               {flat.edges.map((fe) => (
                 <FlowEdgeView key={fe.e.id} fe={fe} theme={theme}
                   selected={sel.kind === 'flowEdge' && sel.id === fe.e.id}
+                  defaultStyle={doc.settings.flowEdgeStyle}
                   onSelect={() => setSel({ kind: 'flowEdge', id: fe.e.id })} />
               ))}
               {/* 流程结点 */}
@@ -693,28 +716,81 @@ function EdgeView({ g, theme, arrowSize, selected, onSelect, onBendStart }: {
   );
 }
 
-/* ================= 流程连线 ================= */
-function FlowEdgeView({ fe, theme, selected, onSelect }: {
-  fe: ReturnType<typeof flattenFlow>['edges'][number]; theme: 'light' | 'dark'; selected: boolean; onSelect: () => void;
+/* ================= 流程连线（折线 / 直角 / 直线，支持虚线） ================= */
+
+/** 连线几何：直线走中心连线；折线/直角从正对侧面出发、中点肘折，圆角 10 / 0 */
+function flowEdgeGeom(fe: { a: FlatFlowNode; b: FlatFlowNode }, style: FlowEdgeStyle):
+  { d: string; labelX: number; labelY: number; ax: number; ay: number; ang: number } {
+  const { a, b } = fe;
+  const acx = a.x + a.w / 2, acy = a.y + a.h / 2, bcx = b.x + b.w / 2, bcy = b.y + b.h / 2;
+  const dx = bcx - acx, dy = bcy - acy;
+
+  if (style === 'straight') {
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len, uy = dy / len;
+    const ts = Math.min((a.w / 2 + 2) / Math.max(Math.abs(ux), 1e-6), (a.h / 2 + 2) / Math.max(Math.abs(uy), 1e-6));
+    const tb = Math.min((b.w / 2 + 2) / Math.max(Math.abs(ux), 1e-6), (b.h / 2 + 2) / Math.max(Math.abs(uy), 1e-6));
+    const sx = acx + ux * ts, sy = acy + uy * ts;
+    const ex = bcx - ux * (tb + 6), ey = bcy - uy * (tb + 6);
+    return { d: `M ${sx} ${sy} L ${ex} ${ey}`, labelX: (sx + ex) / 2, labelY: (sy + ey) / 2, ax: ex, ay: ey, ang: Math.atan2(uy, ux) };
+  }
+
+  const horiz = Math.abs(dx) >= Math.abs(dy);
+  const s = horiz
+    ? { x: dx >= 0 ? a.x + a.w + 2 : a.x - 2, y: acy }
+    : { x: acx, y: dy >= 0 ? a.y + a.h + 2 : a.y - 2 };
+  const e = horiz
+    ? { x: dx >= 0 ? b.x - 7 : b.x + b.w + 7, y: bcy }
+    : { x: bcx, y: dy >= 0 ? b.y - 7 : b.y + b.h + 7 };
+  let pts = horiz
+    ? [{ ...s }, { x: (s.x + e.x) / 2, y: s.y }, { x: (s.x + e.x) / 2, y: e.y }, { ...e }]
+    : [{ ...s }, { x: s.x, y: (s.y + e.y) / 2 }, { x: e.x, y: (s.y + e.y) / 2 }, { ...e }];
+  pts = pts.filter((p, i) => i === 0 || Math.hypot(p.x - pts[i - 1].x, p.y - pts[i - 1].y) > 0.5);
+
+  if (pts.length === 2) {
+    const ang = Math.atan2(pts[1].y - pts[0].y, pts[1].x - pts[0].x);
+    return { d: `M ${pts[0].x} ${pts[0].y} L ${pts[1].x} ${pts[1].y}`, labelX: (pts[0].x + pts[1].x) / 2, labelY: (pts[0].y + pts[1].y) / 2, ax: pts[1].x, ay: pts[1].y, ang };
+  }
+
+  const r = style === 'orthogonal' ? 0 : 10;
+  let d = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p = pts[i];
+    const v1x = p.x - pts[i - 1].x, v1y = p.y - pts[i - 1].y, l1 = Math.hypot(v1x, v1y) || 1;
+    const v2x = pts[i + 1].x - p.x, v2y = pts[i + 1].y - p.y, l2 = Math.hypot(v2x, v2y) || 1;
+    if (r <= 0) { d += ` L ${p.x} ${p.y}`; continue; }
+    const r1 = Math.min(r, l1 / 2), r2 = Math.min(r, l2 / 2);
+    d += ` L ${p.x - (v1x / l1) * r1} ${p.y - (v1y / l1) * r1} Q ${p.x} ${p.y} ${p.x + (v2x / l2) * r2} ${p.y + (v2y / l2) * r2}`;
+  }
+  const last = pts[pts.length - 1], prev = pts[pts.length - 2];
+  d += ` L ${last.x} ${last.y}`;
+  const mi = Math.floor(pts.length / 2);
+  return {
+    d, labelX: (pts[mi - 1].x + pts[mi].x) / 2, labelY: (pts[mi - 1].y + pts[mi].y) / 2,
+    ax: last.x, ay: last.y, ang: Math.atan2(last.y - prev.y, last.x - prev.x),
+  };
+}
+
+function FlowEdgeView({ fe, theme, selected, defaultStyle, onSelect }: {
+  fe: ReturnType<typeof flattenFlow>['edges'][number]; theme: 'light' | 'dark';
+  selected: boolean; defaultStyle: FlowEdgeStyle; onSelect: () => void;
 }) {
   const th = THEME[theme];
   const color = selected ? th.sel : th.edge;
-  const { a, b } = fe;
-  const x1 = a.x + a.w / 2, y1 = a.y + a.h / 2, x2 = b.x + b.w / 2, y2 = b.y + b.h / 2;
-  const ang = Math.atan2(y2 - y1, x2 - x1);
-  const sx = x1 + Math.cos(ang) * a.w / 2, sy = y1 + Math.sin(ang) * a.h / 2;
-  const ex = x2 - Math.cos(ang) * (b.w / 2 + 6), ey = y2 - Math.sin(ang) * (b.h / 2 + 6);
-  const mx = (sx + ex) / 2, my = (sy + ey) / 2;
+  const g = flowEdgeGeom(fe, fe.e.style ?? defaultStyle);
+  const dash = fe.e.dashed ? '7 5' : undefined;
+  const labelW = fe.e.label ? Math.max(44, estWidth(fe.e.label, 10.5) + 18) : 0;
   return (
     <g data-el="1" style={{ cursor: 'pointer' }} onPointerDown={(e) => { e.stopPropagation(); onSelect(); }}>
-      {selected && <line x1={sx} y1={sy} x2={ex} y2={ey} stroke={th.selGlow} strokeWidth={7} strokeLinecap="round" />}
-      <line x1={sx} y1={sy} x2={ex} y2={ey} stroke={color} strokeWidth={selected ? 2.4 : 1.8} strokeLinecap="round" />
-      <line x1={sx} y1={sy} x2={ex} y2={ey} stroke="transparent" strokeWidth={16} />
-      <polygon points={arrowPoints(ex, ey, ang, 13)} fill={color} />
+      {selected && <path d={g.d} fill="none" stroke={th.selGlow} strokeWidth={7} strokeLinecap="round" />}
+      <path d={g.d} fill="none" stroke={color} strokeWidth={selected ? 2.4 : 1.8} strokeLinecap="round" strokeDasharray={dash}
+        style={{ transition: 'stroke .15s' }} />
+      <path d={g.d} fill="none" stroke="transparent" strokeWidth={16} />
+      <polygon points={arrowPoints(g.ax, g.ay, g.ang, 13)} fill={color} />
       {fe.e.label && (
         <g>
-          <rect x={mx - 30} y={my - 11} width={60} height={20} rx={6} fill={th.edgeLabelBg} stroke={selected ? th.sel : th.edgeLabelBorder} />
-          <text x={mx} y={my + 1} textAnchor="middle" dominantBaseline="middle" fontSize={10.5} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{fe.e.label}</text>
+          <rect x={g.labelX - labelW / 2} y={g.labelY - 11} width={labelW} height={20} rx={6} fill={th.edgeLabelBg} stroke={selected ? th.sel : th.edgeLabelBorder} />
+          <text x={g.labelX} y={g.labelY + 1} textAnchor="middle" dominantBaseline="middle" fontSize={10.5} fill={th.edgeLabelText} fontFamily={FONT_STACK}>{fe.e.label}</text>
         </g>
       )}
     </g>
@@ -785,8 +861,10 @@ function PanelView({ pn, theme, selected, glow, onDownPanel, onSelect, onCollaps
         </rect>
       )}
       {selected && !glow && <rect x={pn.x - 5} y={pn.y - 5} width={pn.w + 10} height={pn.h + 10} rx={15} fill="none" stroke={th.selGlow} strokeWidth={5} />}
-      <rect x={pn.x} y={pn.y} width={pn.w} height={pn.h} rx={12} fill={fill} opacity={glow ? 0.30 : 0.16}
+      {/* 面板主体：不透明主题底色（亮色下也足够深）+ 一层淡色身份色 */}
+      <rect x={pn.x} y={pn.y} width={pn.w} height={pn.h} rx={12} fill={th.panelFill}
         stroke={glow || selected ? th.sel : stroke} strokeWidth={glow ? 2.6 : selected ? 2.2 : 1.4} strokeDasharray="6 4" pointerEvents="none" />
+      <rect x={pn.x} y={pn.y} width={pn.w} height={pn.h} rx={12} fill={fill} opacity={glow ? 0.16 : 0.09} pointerEvents="none" />
       <g onPointerDown={(e) => { onDownPanel(e); onSelect(); }} style={{ cursor: 'move' }}>
         <path d={`M ${pn.x + 12} ${pn.y} H ${pn.x + pn.w - 12} A 12 12 0 0 1 ${pn.x + pn.w} ${pn.y + 12} V ${pn.y + C_HEADER} H ${pn.x} V ${pn.y + 12} A 12 12 0 0 1 ${pn.x + 12} ${pn.y} Z`}
           fill={fill} stroke={selected ? th.sel : stroke} strokeWidth={selected ? 2.2 : 1.4} />

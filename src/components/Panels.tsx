@@ -10,9 +10,9 @@ import {
   COLOR_ORDER, COLOR_LABELS, PALETTES, SHAPE_COLOR_ORDER, SHAPE_COLORS,
   nodeSize, formatLabel,
 } from '../lib/core';
-import type { PaletteColor, ProjectTransition, ShapeColorKey } from '../lib/core';
+import type { PaletteColor, ProjectTransition, ShapeColorKey, FlowEdge, FlowEdgeStyle } from '../lib/core';
 import { makeFlowNode } from '../lib/core';
-import { findFlowNode, updateFlowNode, toggleSubInDoc, layoutFlowGraph, distribute } from '../lib/studio';
+import { findFlowNode, updateFlowNode, toggleSubInDoc, layoutFlowGraph, distribute, mapAllFlowEdges } from '../lib/studio';
 import type { AlItem } from '../lib/studio';
 
 /* ---------- 内联图标 ---------- */
@@ -186,11 +186,20 @@ export function LeftPanel({ open, onToggle }: { open: boolean; onToggle: () => v
         <ToggleRow label="对齐网格" on={doc.settings.snapToGrid} onChange={(v) => app.set({ ...doc, settings: { ...doc.settings, snapToGrid: v } }, false)} />
         <ToggleRow label="状态动作文本" on={doc.settings.showActionText} onChange={(v) => app.set({ ...doc, settings: { ...doc.settings, showActionText: v } })} />
         <div className="py-1.5">
-          <span className="text-[11.5px] font-medium block mb-1.5" style={{ color: 'var(--text)' }}>默认连线形状</span>
+          <span className="text-[11.5px] font-medium block mb-1.5" style={{ color: 'var(--text)' }}>状态转移线形</span>
           <div className="seg w-full">
             {([['smoothstep', '折线'], ['bezier', '曲线'], ['orthogonal', '直角'], ['straight', '直线']] as const).map(([v, t]) => (
               <button key={v} className={`seg-btn flex-1 ${doc.settings.edgeStyle === v ? 'on' : ''}`}
                 onClick={() => app.set({ ...doc, settings: { ...doc.settings, edgeStyle: v } })}>{t}</button>
+            ))}
+          </div>
+        </div>
+        <div className="py-1.5">
+          <span className="text-[11.5px] font-medium block mb-1.5" style={{ color: 'var(--text)' }}>流程图连线线形</span>
+          <div className="seg w-full">
+            {([['smoothstep', '折线'], ['orthogonal', '直角'], ['straight', '直线']] as const).map(([v, t]) => (
+              <button key={v} className={`seg-btn flex-1 ${doc.settings.flowEdgeStyle === v ? 'on' : ''}`}
+                onClick={() => app.set({ ...doc, settings: { ...doc.settings, flowEdgeStyle: v } })}>{t}</button>
             ))}
           </div>
         </div>
@@ -264,6 +273,7 @@ export function Inspector({ open, onToggle }: { open: boolean; onToggle: () => v
     if (sel.kind === 'state' && sel.id) { const s = page.states.find((x) => x.id === sel.id); return s ? <StateInspector id={s.id} /> : null; }
     if (sel.kind === 'transition' && sel.id) { const t = page.transitions.find((x) => x.id === sel.id); return t ? <TransitionInspector t={t} /> : null; }
     if (sel.kind === 'flow' && sel.id) { const n = findFlowNode(page.flowNodes, sel.id); return n ? <FlowInspector id={n.id} /> : null; }
+    if (sel.kind === 'flowEdge' && sel.id) return <FlowEdgeInspector id={sel.id} />;
     if (sel.kind === 'wb' && sel.id) { const w = page.wbShapes.find((x) => x.id === sel.id); return w ? <WbInspector id={w.id} /> : null; }
     return <EmptyInspector />;
   }, [sel, page]);
@@ -459,6 +469,46 @@ function FlowInspector({ id }: { id: string }) {
           </p>
         </>
       )}
+      <DeleteBtn onClick={app.deleteSel} />
+    </>
+  );
+}
+
+/* ---------- 流程连线 ---------- */
+function FlowEdgeInspector({ id }: { id: string }) {
+  const app = useStudio();
+  const e = app.page.flowEdges.find((x) => x.id === id);
+  if (!e) return <EmptyInspector />;
+  const up = (patch: Partial<FlowEdge>) =>
+    app.updatePage((p) => {
+      const r = mapAllFlowEdges(p.flowNodes, p.flowEdges, id, patch);
+      return { ...p, flowNodes: r.nodes, flowEdges: r.edges };
+    });
+  const styleVal = e.style ?? app.doc.settings.flowEdgeStyle;
+  return (
+    <>
+      <Head title="流程连线" sub="流程图元素之间 · 同层连接" />
+      <Field label="标签">
+        <input className="field-input w-full" value={e.label ?? ''} placeholder="如：完成 / 通过"
+          onChange={(ev) => up({ label: ev.target.value || undefined })} />
+      </Field>
+      <Field label="线形">
+        <div className="seg w-full">
+          {([['smoothstep', '折线'], ['orthogonal', '直角'], ['straight', '直线']] as [FlowEdgeStyle, string][]).map(([v, t]) => (
+            <button key={v} className={`seg-btn flex-1 ${styleVal === v ? 'on' : ''}`}
+              onClick={() => up({ style: v })}>{t}</button>
+          ))}
+        </div>
+        <p className="text-[10px] mt-1.5" style={{ color: 'var(--muted)' }}>
+          {e.style ? '单条覆盖（仅作用于这条连线）' : `跟随全局「${{ smoothstep: '折线', orthogonal: '直角', straight: '直线' }[app.doc.settings.flowEdgeStyle]}」`}
+        </p>
+      </Field>
+      <div className="px-3.5 py-1.5 flex items-center justify-between">
+        <span className="text-[11.5px] font-medium" style={{ color: 'var(--text)' }}>虚线</span>
+        <button className={`switch ${e.dashed ? 'on' : ''}`} onClick={() => up({ dashed: !e.dashed })} aria-label="虚线">
+          <span className="absolute top-[2px] rounded-full bg-white transition-all" style={{ width: 15, height: 15, left: e.dashed ? 17 : 2 }} />
+        </button>
+      </div>
       <DeleteBtn onClick={app.deleteSel} />
     </>
   );

@@ -220,7 +220,7 @@ export function distribute(items: AlItem[], axis: 'x' | 'y'): Map<string, { x: n
 }
 
 /* ---------------- 持久化 / 规范化 ---------------- */
-const LS_KEY = 'stateflow-studio.pages.v4';
+const LS_KEY = 'stateflow-studio.pages.v5';
 const FLOW_KINDS = ['start', 'process', 'decision', 'io', 'subprocess'] as const;
 const SHAPE_KEYS = Object.keys(SHAPE_COLORS);
 
@@ -255,7 +255,22 @@ function normalizeFlowNodes(raw: unknown): FlowNode[] {
 function normalizeFlowEdges(raw: unknown): FlowEdge[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((e) => e && typeof e.source === 'string' && typeof e.target === 'string')
-    .map((e) => ({ id: typeof e.id === 'string' ? e.id : uid('fe'), source: e.source, target: e.target, label: e.label || undefined }));
+    .map((e) => {
+      const fe: FlowEdge = { id: typeof e.id === 'string' ? e.id : uid('fe'), source: e.source, target: e.target, label: e.label || undefined };
+      if (e.style === 'smoothstep' || e.style === 'orthogonal' || e.style === 'straight') fe.style = e.style;
+      if (e.dashed === true) fe.dashed = true;
+      return fe;
+    });
+}
+
+/** 递归更新指定 id 的连线（覆盖顶层与所有子流程内部层级） */
+export function mapAllFlowEdges(
+  nodes: FlowNode[], edges: FlowEdge[], id: string, patch: Partial<FlowEdge>,
+): { nodes: FlowNode[]; edges: FlowEdge[] } {
+  const mapE = (es: FlowEdge[]) => es.map((e) => (e.id === id ? { ...e, ...patch } : e));
+  const mapN = (ns: FlowNode[]): FlowNode[] => ns.map((n) =>
+    n.inner ? { ...n, inner: { nodes: mapN(n.inner.nodes), edges: mapE(n.inner.edges) } } : n);
+  return { nodes: mapN(nodes), edges: mapE(edges) };
 }
 function normalizeWb(raw: unknown): WbShape[] {
   if (!Array.isArray(raw)) return [];
@@ -370,8 +385,8 @@ function buildFlowSample(): Page {
   const flow = makePage('canvas', '订单处理流程');
   flow.flowDir = 'TB';
   const fk = (kind: FlowKind, text: string) => { const n = makeFlowNode(kind, 0, 0); n.text = text; return n; };
-  const fe = (source: string, target: string, label?: string): FlowEdge =>
-    ({ id: uid('fe'), source, target, ...(label ? { label } : {}) });
+  const fe = (source: string, target: string, label?: string, extra?: Partial<FlowEdge>): FlowEdge =>
+    ({ id: uid('fe'), source, target, ...(label ? { label } : {}), ...extra });
 
   // 最内层 E：开始 → 计算 F → 结束
   const gS = fk('start', '开始'), gF = fk('process', '计算 F'), gEnd = fk('start', '结束');
@@ -385,7 +400,7 @@ function buildFlowSample(): Page {
   const dEdges: FlowEdge[] = [
     fe(dS.id, dD.id), fe(dD.id, dQ.id),
     fe(dQ.id, eN.id, '是'), fe(eN.id, dEnd.id),
-    fe(dQ.id, dEnd.id, '否'),
+    fe(dQ.id, dEnd.id, '否', { style: 'orthogonal', dashed: true }),
   ];
   const bN = fk('subprocess', '核算流程 B');
   bN.inner = { nodes: layoutFlowGraph([dS, dD, dQ, eN, dEnd], dEdges, 'TB'), edges: dEdges };

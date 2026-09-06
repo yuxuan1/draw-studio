@@ -168,6 +168,7 @@ export interface ProjectTransition {
 }
 export interface ProjectSettings {
   theme: ThemeMode; edgeStyle: 'bezier' | 'smoothstep' | 'orthogonal' | 'straight';
+  flowEdgeStyle: FlowEdgeStyle;
   showGrid: boolean; showMiniMap: boolean; snapToGrid: boolean; showActionText: boolean;
   edgeWidth: number; arrowSize: number;
 }
@@ -175,7 +176,11 @@ export interface ProjectSettings {
 export interface ProjectDoc { states: ProjectState[]; transitions: ProjectTransition[] }
 
 export type FlowKind = 'start' | 'process' | 'decision' | 'io' | 'subprocess';
-export interface FlowEdge { id: string; source: string; target: string; label?: string }
+export type FlowEdgeStyle = 'smoothstep' | 'orthogonal' | 'straight';
+export interface FlowEdge {
+  id: string; source: string; target: string; label?: string;
+  style?: FlowEdgeStyle; dashed?: boolean;
+}
 export interface InnerFlow { nodes: FlowNode[]; edges: FlowEdge[] }
 export interface FlowNode {
   id: string; kind: FlowKind; text: string;
@@ -208,7 +213,7 @@ export function uid(prefix: string): string {
 
 /* ---------------- 默认值 / 工厂 ---------------- */
 export function defaultSettings(theme: ThemeMode = 'light'): ProjectSettings {
-  return { theme, edgeStyle: 'smoothstep', showGrid: true, showMiniMap: true, snapToGrid: true, showActionText: true, edgeWidth: 1.6, arrowSize: 16 };
+  return { theme, edgeStyle: 'smoothstep', flowEdgeStyle: 'smoothstep', showGrid: true, showMiniMap: true, snapToGrid: true, showActionText: true, edgeWidth: 1.6, arrowSize: 16 };
 }
 const FLOW_DEFAULTS: Record<FlowKind, { w: number; h: number; text: string; color: ShapeColorKey }> = {
   start: { w: 118, h: 44, text: '开始', color: 'green' },
