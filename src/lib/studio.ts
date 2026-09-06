@@ -1,142 +1,28 @@
 /* ============================================================
- * 统一画布数据层 v2
- * · 多页面：画布页（状态机 + 流程图）/ 白板页
- * · 子流程：可递归展开的容器节点（[[...]]），内部是完整小流程图
- * · 流程图以「结点 + 连线」建模，同类型元素自由连线
+ * studio —— 流程图布局 / 子流程浮动面板 / 多选对齐 / 持久化 / 规范化 / 示例
  * ============================================================ */
-import type {
-  ProjectState, ProjectTransition, ProjectSettings, NodeKind, PaletteColor,
-} from './core';
-import { defaultSettings } from './core';
+import type { FlowNode, FlowEdge, InnerFlow, Page, PageType, StudioDoc, ThemeMode, WbShape, ProjectState, ProjectTransition } from './core';
+import { makePage, uid, SHAPE_COLORS, defaultSettings, ensureStartNode } from './core';
 
-export type FlowKind = 'start' | 'process' | 'decision' | 'io' | 'subprocess';
-export type PageType = 'canvas' | 'whiteboard';
 export type Dir = 'LR' | 'TB';
-export type WbKind = 'image' | 'rect' | 'ellipse' | 'arrow' | 'line' | 'text';
+export interface Rect { x: number; y: number; w: number; h: number }
 
-export interface FlowEdge { id: string; source: string; target: string; label?: string }
-export interface InnerFlow { nodes: FlowNode[]; edges: FlowEdge[] }
-
-export interface FlowNode {
-  id: string;
-  kind: FlowKind;
-  text: string;
-  x: number; y: number; w: number; h: number;   // 结点紧凑尺寸（主流程占位，展开后也不变）
-  fill: string; stroke: string;
-  inner?: InnerFlow;      // 仅 subprocess：内部小流程图
-  expanded?: boolean;     // 仅 subprocess：是否展开
-  expandPos?: { x: number; y: number };  // 仅 subprocess：展开面板在本层坐标系的位置（记忆）
-}
-
-export interface WbShape {
-  id: string; kind: WbKind;
-  x: number; y: number; w: number; h: number;
-  fill: string; stroke: string; strokeWidth: number;
-  text?: string; src?: string;
-}
-
-export interface Page {
-  id: string;
-  name: string;
-  type: PageType;
-  /* 画布页内容 */
-  states: ProjectState[];
-  transitions: ProjectTransition[];
-  flowNodes: FlowNode[];
-  flowEdges: FlowEdge[];
-  flowDir: Dir;
-  /* 白板页内容 */
-  wbShapes: WbShape[];
-}
-
-export interface StudioDoc {
-  version: 2;
-  name: string;
-  settings: ProjectSettings;
-  pages: Page[];
-  activePageId: string;
-}
-
-let seq = 0;
-export function nid(prefix: string): string {
-  seq = (seq + 1) % 1296;
-  return `${prefix}_${Date.now().toString(36).slice(-4)}${seq.toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`;
-}
-
-/* ---------------- 工厂 ---------------- */
-
-export function makePage(type: PageType, name: string): Page {
-  return {
-    id: nid('p'), name, type,
-    states: [], transitions: [], flowNodes: [], flowEdges: [], flowDir: 'TB',
-    wbShapes: [],
-  };
-}
-
-export function defaultStudioDoc(name = '未命名工程'): StudioDoc {
-  const p = makePage('canvas', '画布 1');
-  return { version: 2, name, settings: defaultSettings(), pages: [p], activePageId: p.id };
-}
-
-export function makeSmState(kind: NodeKind, x: number, y: number, name: string): ProjectState {
-  return {
-    id: nid('s'), name, kind,
-    color: (kind === 'junction' || kind === 'start' ? 'slate' : 'indigo') as PaletteColor,
-    position: { x, y },
-  };
-}
-
-const FLOW_DEFAULTS: Record<FlowKind, { w: number; h: number; text: string; fill: string; stroke: string }> = {
-  start:      { w: 118, h: 44, text: '开始',     fill: '#dcfce7', stroke: '#22c55e' },
-  process:    { w: 132, h: 52, text: '新流程',   fill: '#eef2ff', stroke: '#6366f1' },
-  decision:   { w: 148, h: 74, text: '判定?',    fill: '#fef3c7', stroke: '#f59e0b' },
-  io:         { w: 140, h: 52, text: '输入/输出', fill: '#e0f2fe', stroke: '#0ea5e9' },
-  subprocess: { w: 190, h: 64, text: '子流程',   fill: '#f3e8ff', stroke: '#a855f7' },
-};
-
-export function makeFlowNode(kind: FlowKind, x: number, y: number): FlowNode {
-  const d = FLOW_DEFAULTS[kind];
-  const n: FlowNode = { id: nid('f'), kind, text: d.text, x, y, w: d.w, h: d.h, fill: d.fill, stroke: d.stroke };
-  if (kind === 'subprocess') { n.inner = { nodes: [], edges: [] }; n.expanded = false; }
-  return n;
-}
-
-export function makeWbShape(kind: WbKind, x: number, y: number): WbShape {
-  const base: WbShape = {
-    id: nid('w'), kind, x, y, w: 160, h: 100,
-    fill: 'rgba(99,102,241,0.16)', stroke: '#6366f1', strokeWidth: 2,
-  };
-  if (kind === 'ellipse') { base.fill = 'rgba(14,165,233,0.16)'; base.stroke = '#0ea5e9'; }
-  if (kind === 'arrow') { base.w = 160; base.h = 0; base.fill = 'none'; base.stroke = '#f43f5e'; base.strokeWidth = 2.5; }
-  if (kind === 'line') { base.w = 160; base.h = 0; base.fill = 'none'; base.stroke = '#64748b'; base.strokeWidth = 2; }
-  if (kind === 'text') { base.w = 180; base.h = 40; base.fill = 'none'; base.stroke = 'transparent'; base.text = '双击编辑文字'; }
-  return base;
-}
-
-/* ---------------- 子流程几何 ---------------- */
-
-export const C_PAD = 18;     // 面板内边距
-export const C_HEADER = 34;  // 面板头部高度
+export const C_PAD = 18;
+export const C_HEADER = 34;
 export const PANEL_MIN_W = 260;
 export const PANEL_MIN_H = 150;
 
-/** 结点紧凑尺寸：子流程结点在主流程中永远只占这一小块（保证主布局稳定） */
-export function flowNodeSize(n: FlowNode): { w: number; h: number } {
-  return { w: n.w, h: n.h };
-}
+export function flowNodeSize(n: FlowNode): { w: number; h: number } { return { w: n.w, h: n.h }; }
 
-/** 展开面板尺寸：由内部内容包围盒 + 头部 + 内边距推得（递归计入嵌套面板） */
 export function panelSize(n: FlowNode): { w: number; h: number } {
   const inner = n.inner;
   if (!inner || !inner.nodes.length) return { w: Math.max(n.w, PANEL_MIN_W), h: PANEL_MIN_H };
   let x2 = 0, y2 = 0;
   for (const k of inner.nodes) {
-    x2 = Math.max(x2, k.x + k.w);
-    y2 = Math.max(y2, k.y + k.h);
+    x2 = Math.max(x2, k.x + k.w); y2 = Math.max(y2, k.y + k.h);
     if (k.kind === 'subprocess' && k.expanded && k.expandPos) {
       const ps = panelSize(k);
-      x2 = Math.max(x2, k.expandPos.x + ps.w);
-      y2 = Math.max(y2, k.expandPos.y + ps.h);
+      x2 = Math.max(x2, k.expandPos.x + ps.w); y2 = Math.max(y2, k.expandPos.y + ps.h);
     }
   }
   return { w: Math.max(PANEL_MIN_W, x2 + C_PAD * 2), h: Math.max(PANEL_MIN_H, y2 + C_HEADER + C_PAD) };
@@ -146,16 +32,8 @@ export interface FlatFlowNode { n: FlowNode; path: string[]; x: number; y: numbe
 export interface FlatFlowEdge { e: FlowEdge; path: string[]; a: FlatFlowNode; b: FlatFlowNode }
 export interface FlatPanel { id: string; path: string[]; n: FlowNode; x: number; y: number; w: number; h: number }
 
-/**
- * 递归展平：子流程结点本体按紧凑尺寸落在原位；
- * 展开的面板以其记忆位置 expandPos 为原点独立摆放，内部结点换算到面板内容区。
- */
-export function flattenFlow(
-  nodes: FlowNode[], edges: FlowEdge[], ox = 0, oy = 0, path: string[] = [],
-): { nodes: FlatFlowNode[]; edges: FlatFlowEdge[]; panels: FlatPanel[] } {
-  const flatN: FlatFlowNode[] = [];
-  const flatE: FlatFlowEdge[] = [];
-  const panels: FlatPanel[] = [];
+export function flattenFlow(nodes: FlowNode[], edges: FlowEdge[], ox = 0, oy = 0, path: string[] = []) {
+  const flatN: FlatFlowNode[] = []; const flatE: FlatFlowEdge[] = []; const panels: FlatPanel[] = [];
   const posMap = new Map<string, FlatFlowNode>();
   const walk = (ns: FlowNode[], es: FlowEdge[], wx: number, wy: number, p: string[]) => {
     for (const n of ns) {
@@ -177,11 +55,25 @@ export function flattenFlow(
   return { nodes: flatN, edges: flatE, panels };
 }
 
-/** 对 path 指定层级的 {nodes, edges} 做变换（path=[] 为顶层） */
-export function mapFlowLevel(
-  nodes: FlowNode[], edges: FlowEdge[], path: string[],
-  fn: (f: InnerFlow) => InnerFlow,
-): { nodes: FlowNode[]; edges: FlowEdge[] } {
+/* ---------------- 树工具 ---------------- */
+export function findFlowNode(nodes: FlowNode[], id: string): FlowNode | null {
+  for (const n of nodes) {
+    if (n.id === id) return n;
+    if (n.inner) { const r = findFlowNode(n.inner.nodes, id); if (r) return r; }
+  }
+  return null;
+}
+export function updateFlowNode(nodes: FlowNode[], id: string, patch: Partial<FlowNode>): FlowNode[] {
+  return nodes.map((n) => {
+    if (n.id === id) return { ...n, ...patch };
+    if (n.inner) {
+      const inner = updateFlowNode(n.inner.nodes, id, patch);
+      if (inner !== n.inner.nodes) return { ...n, inner: { nodes: inner, edges: n.inner.edges } };
+    }
+    return n;
+  });
+}
+export function mapFlowLevel(nodes: FlowNode[], edges: FlowEdge[], path: string[], fn: (f: InnerFlow) => InnerFlow): { nodes: FlowNode[]; edges: FlowEdge[] } {
   if (!path.length) { const r = fn({ nodes, edges }); return { nodes: r.nodes, edges: r.edges }; }
   const [head, ...rest] = path;
   return {
@@ -194,99 +86,46 @@ export function mapFlowLevel(
   };
 }
 
-/** 递归查找结点 */
-export function findFlowNode(nodes: FlowNode[], id: string): FlowNode | null {
-  for (const n of nodes) {
-    if (n.id === id) return n;
-    if (n.inner) { const f = findFlowNode(n.inner.nodes, id); if (f) return f; }
-  }
-  return null;
-}
-
-/** 递归更新结点（任意层级，按 id） */
-export function updateFlowNode(nodes: FlowNode[], id: string, patch: Partial<FlowNode>): FlowNode[] {
-  return nodes.map((n) => {
-    if (n.id === id) return { ...n, ...patch };
-    if (n.inner) return { ...n, inner: { ...n.inner, nodes: updateFlowNode(n.inner.nodes, id, patch) } };
-    return n;
-  });
-}
-
-/** 递归删除：按 id 移除结点（含子树）、关联连线或指定连线 */
-export function pruneFlow(nodes: FlowNode[], edges: FlowEdge[], id: string): InnerFlow {
-  const ns = nodes
-    .filter((n) => n.id !== id)
-    .map((n) => (n.inner ? { ...n, inner: pruneFlow(n.inner.nodes, n.inner.edges, id) } : n));
-  const es = edges.filter((e) => e.id !== id && e.source !== id && e.target !== id);
-  return { nodes: ns, edges: es };
-}
-
-/* ---------------- 流程图层级布局（支持子流程嵌套，后序递归） ---------------- */
-
-const LAYER_GAP = 96;
-const NODE_GAP = 30;
-
-/**
- * 层级布局（仅作用于传入的这一层；子流程按紧凑尺寸占位，内部位置不被改动）。
- * 输出坐标从 (0,0) 起算 —— 对子流程内部调用时即为面板内容区坐标。
- */
+/* ---------------- 层级布局（仅作用于单层，子流程按紧凑尺寸占位） ---------------- */
+const NODE_GAP = 54;
+const LAYER_GAP = 110;
 export function layoutFlowGraph(nodes: FlowNode[], edges: FlowEdge[], dir: Dir): FlowNode[] {
   if (!nodes.length) return nodes;
-  const ns = nodes;
   const size = (n: FlowNode) => flowNodeSize(n);
-  const ids = new Set(ns.map((n) => n.id));
-  const es = edges.filter((e) => ids.has(e.source) && ids.has(e.target) && e.source !== e.target);
-
-  /* 2) 最长路径分层（Kahn；环上结点追加到末层） */
-  const indeg = new Map(ns.map((n) => [n.id, 0]));
-  const adj = new Map<string, string[]>();
-  for (const e of es) {
-    indeg.set(e.target, (indeg.get(e.target) ?? 0) + 1);
-    adj.set(e.source, [...(adj.get(e.source) ?? []), e.target]);
-  }
-  const layer = new Map<string, number>();
-  const queue = ns.filter((n) => indeg.get(n.id) === 0).map((n) => n.id);
-  queue.forEach((id) => layer.set(id, 0));
-  let qi = 0;
-  while (qi < queue.length) {
-    const u = queue[qi++];
-    for (const v of adj.get(u) ?? []) {
-      layer.set(v, Math.max(layer.get(v) ?? 0, (layer.get(u) ?? 0) + 1));
-      indeg.set(v, indeg.get(v)! - 1);
-      if (indeg.get(v) === 0) queue.push(v);
+  const ids = nodes.map((n) => n.id);
+  const indeg = new Map<string, number>(); ids.forEach((id) => indeg.set(id, 0));
+  const adj = new Map<string, string[]>(); ids.forEach((id) => adj.set(id, []));
+  for (const e of edges) {
+    if (indeg.has(e.source) && indeg.has(e.target) && e.source !== e.target) {
+      indeg.set(e.target, (indeg.get(e.target) ?? 0) + 1);
+      adj.get(e.source)!.push(e.target);
     }
   }
-  let maxL = 0;
-  layer.forEach((l) => { maxL = Math.max(maxL, l); });
-  for (const n of ns) if (!layer.has(n.id)) layer.set(n.id, ++maxL);
-
-  /* 3) 层内排序：原始顺序 + 一轮重心法 */
-  const layers: FlowNode[][] = [];
-  for (const n of ns) {
-    const l = layer.get(n.id)!;
-    (layers[l] ??= []).push(n);
+  // 拓扑分层（Kahn），环上结点兜底放最后一层
+  const layer = new Map<string, number>();
+  const queue = ids.filter((id) => (indeg.get(id) ?? 0) === 0);
+  queue.forEach((id) => layer.set(id, 0));
+  const indeg2 = new Map(indeg);
+  const q = [...queue];
+  while (q.length) {
+    const u = q.shift()!;
+    for (const v of adj.get(u) ?? []) {
+      layer.set(v, Math.max(layer.get(v) ?? 0, (layer.get(u) ?? 0) + 1));
+      indeg2.set(v, (indeg2.get(v) ?? 1) - 1);
+      if (indeg2.get(v) === 0) q.push(v);
+    }
   }
-  const pred = new Map<string, string[]>();
-  for (const e of es) pred.set(e.target, [...(pred.get(e.target) ?? []), e.source]);
-  for (let l = 1; l < layers.length; l++) {
-    const prevOrder = new Map(layers[l - 1].map((n, i) => [n.id, i]));
-    layers[l].sort((a, b) => {
-      const bar = (n: FlowNode) => {
-        const ps = (pred.get(n.id) ?? []).map((p) => prevOrder.get(p)).filter((v) => v !== undefined) as number[];
-        return ps.length ? ps.reduce((s, v) => s + v, 0) / ps.length : 0;
-      };
-      return bar(a) - bar(b);
-    });
-  }
-
-  /* 4) 放置：主轴逐层推进，副轴居中堆叠 */
+  let maxLayer = 0; layer.forEach((l) => { maxLayer = Math.max(maxLayer, l); });
+  ids.forEach((id) => { if (!layer.has(id)) layer.set(id, maxLayer + 1); });
+  const layers = new Map<number, string[]>();
+  ids.forEach((id) => { const l = layer.get(id)!; if (!layers.has(l)) layers.set(l, []); layers.get(l)!.push(id); });
+  // 逐层排放
   const placed = new Map<string, { m: number; c: number }>();
   let cursorM = 0;
-  for (const ln of layers) {
-    if (!ln) continue;
-    const total = ln.reduce((a, n) => a + (dir === 'LR' ? size(n).h : size(n).w), 0) + NODE_GAP * (ln.length - 1);
-    let cursorC = -total / 2;
-    let maxM = 0;
+  const sortedLayers = [...layers.keys()].sort((a, b) => a - b);
+  for (const l of sortedLayers) {
+    const ln = layers.get(l)!.map((id) => nodes.find((n) => n.id === id)!);
+    let cursorC = 0, maxM = 0;
     for (const n of ln) {
       const s = size(n);
       const cross = dir === 'LR' ? s.h : s.w;
@@ -297,57 +136,51 @@ export function layoutFlowGraph(nodes: FlowNode[], edges: FlowEdge[], dir: Dir):
     }
     cursorM += maxM + LAYER_GAP;
   }
-
-  /* 5) 归一化：先算出每个结点的矩形，再按整体包围盒平移到 (0,0)，
-        保证所有坐标 ≥ 0 —— 子流程内部布局不会越出面板内容区 */
+  // 归一化到 (0,0)：按整体包围盒平移，保证所有坐标 ≥ 0（不越出面板）
   let minM = Infinity, minC = Infinity;
   placed.forEach((p) => { minM = Math.min(minM, p.m); minC = Math.min(minC, p.c); });
-  const rects = ns.map((n) => {
-    const p = placed.get(n.id)!;
-    const s = size(n);
+  const rects = nodes.map((n) => {
+    const p = placed.get(n.id)!; const s = size(n);
     const m = p.m - minM, c = p.c - minC - (dir === 'LR' ? s.h : s.w) / 2;
-    return dir === 'LR'
-      ? { n, x: m, y: c, w: s.w, h: s.h }
-      : { n, x: c, y: m, w: s.w, h: s.h };
+    return dir === 'LR' ? { n, x: m, y: c, w: s.w, h: s.h } : { n, x: c, y: m, w: s.w, h: s.h };
   });
   const bx = Math.min(...rects.map((r) => r.x));
   const by = Math.min(...rects.map((r) => r.y));
   return rects.map((r) => ({ ...r.n, x: Math.round(r.x - bx), y: Math.round(r.y - by) }));
 }
-
-/** 重排子流程内部（面板内容区坐标），不触碰面板位置 */
 export function layoutInner(n: FlowNode, dir: Dir): FlowNode {
   if (n.kind !== 'subprocess' || !n.inner) return n;
   return { ...n, inner: { nodes: layoutFlowGraph(n.inner.nodes, n.inner.edges, dir), edges: n.inner.edges } };
 }
 
-/**
- * 展开/收纳子流程（画布与属性面板共用的唯一入口）。
- * 展开：首次→内部自动布局 + 同层碰撞避让选址；再次→复用记忆位置。
- * 收纳：仅收起，内部布局与面板位置全部保留。
- */
-export function toggleSubInDoc(
-  nodes: FlowNode[], edges: FlowEdge[], id: string, flowDir: Dir, extraObstacles: Rect[] = [],
-): { nodes: FlowNode[]; edges: FlowEdge[] } {
-  const locate = (ns: FlowNode[], es: FlowEdge[]): { ns: FlowNode[]; n: FlowNode } | null => {
+/* ---------------- 子流程展开/收纳（碰撞避让选址） ---------------- */
+const EXPAND_GAP = 72;
+export function computeExpandPos(node: Rect, pw: number, ph: number, obstacles: Rect[], flowDir: Dir): { x: number; y: number } {
+  const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
+  const horiz = flowDir === 'LR';
+  const candidates = (m: number) => (horiz
+    ? [{ x: cx - pw / 2, y: node.y + node.h + m }, { x: cx - pw / 2, y: node.y - m - ph }, { x: node.x + node.w + m, y: cy - ph / 2 }, { x: node.x - m - pw, y: cy - ph / 2 }]
+    : [{ x: node.x + node.w + m, y: cy - ph / 2 }, { x: node.x - m - pw, y: cy - ph / 2 }, { x: cx - pw / 2, y: node.y + node.h + m }, { x: cx - pw / 2, y: node.y - m - ph }]);
+  const M = 14;
+  const hit = (r: Rect) => obstacles.some((o) => r.x < o.x + o.w + M && r.x + r.w + M > o.x && r.y < o.y + o.h + M && r.y + r.h + M > o.y);
+  for (const m of [EXPAND_GAP, EXPAND_GAP * 2, EXPAND_GAP * 3.2, EXPAND_GAP * 4.6]) {
+    for (const c of candidates(m)) if (!hit({ x: c.x, y: c.y, w: pw, h: ph })) return { x: Math.round(c.x), y: Math.round(c.y) };
+  }
+  const fb = candidates(EXPAND_GAP)[0];
+  return { x: Math.round(fb.x), y: Math.round(fb.y) };
+}
+export function toggleSubInDoc(nodes: FlowNode[], edges: FlowEdge[], id: string, flowDir: Dir, extraObstacles: Rect[] = []): { nodes: FlowNode[]; edges: FlowEdge[] } {
+  const locate = (ns: FlowNode[]): { ns: FlowNode[]; n: FlowNode } | null => {
     for (const n of ns) if (n.id === id) return { ns, n };
-    for (const n of ns) if (n.inner) {
-      const r = locate(n.inner.nodes, n.inner.edges);
-      if (r) return r;
-    }
+    for (const n of ns) if (n.inner) { const r = locate(n.inner.nodes); if (r) return r; }
     return null;
   };
-  const loc = locate(nodes, edges);
+  const loc = locate(nodes);
   if (!loc || loc.n.kind !== 'subprocess') return { nodes, edges };
   const n = loc.n;
-  if (n.expanded) {
-    return { nodes: updateFlowNode(nodes, id, { expanded: false }), edges };
-  }
-  let inner = n.inner;
-  let expandPos = n.expandPos;
-  if (!expandPos && inner && inner.nodes.length) {
-    inner = { nodes: layoutFlowGraph(inner.nodes, inner.edges, flowDir), edges: inner.edges };
-  }
+  if (n.expanded) return { nodes: updateFlowNode(nodes, id, { expanded: false }), edges };
+  let inner = n.inner; let expandPos = n.expandPos;
+  if (!expandPos && inner && inner.nodes.length) inner = { nodes: layoutFlowGraph(inner.nodes, inner.edges, flowDir), edges: inner.edges };
   const tmp: FlowNode = { ...n, inner, expanded: true };
   if (!expandPos) {
     const ps = panelSize(tmp);
@@ -365,210 +198,160 @@ export function toggleSubInDoc(
   return { nodes: updateFlowNode(nodes, id, { expanded: true, inner, expandPos }), edges };
 }
 
-/* ---------------- 面板智能选址（碰撞避让） ---------------- */
-
-export interface Rect { x: number; y: number; w: number; h: number }
-const EXPAND_GAP = 72;
-
-/**
- * 为展开面板挑选位置：优先主流程的侧向（横向流程→下/上，纵向流程→右/左），
- * 逐个候选做碰撞检测；无空位时逐圈向外搜索。返回的坐标与结点同坐标系。
- */
-export function computeExpandPos(
-  node: Rect, pw: number, ph: number, obstacles: Rect[], flowDir: Dir,
-): { x: number; y: number } {
-  const cx = node.x + node.w / 2, cy = node.y + node.h / 2;
-  const horiz = flowDir === 'LR';
-  const candidates = (m: number): { x: number; y: number }[] => (horiz
-    ? [
-        { x: cx - pw / 2, y: node.y + node.h + m },   // 下方
-        { x: cx - pw / 2, y: node.y - m - ph },        // 上方
-        { x: node.x + node.w + m, y: cy - ph / 2 },    // 右
-        { x: node.x - m - pw, y: cy - ph / 2 },        // 左
-      ]
-    : [
-        { x: node.x + node.w + m, y: cy - ph / 2 },    // 右
-        { x: node.x - m - pw, y: cy - ph / 2 },        // 左
-        { x: cx - pw / 2, y: node.y + node.h + m },    // 下
-        { x: cx - pw / 2, y: node.y - m - ph },        // 上
-      ]);
-  const M = 14; // 安全边距
-  const hit = (r: Rect) => obstacles.some(
-    (o) => r.x < o.x + o.w + M && r.x + r.w + M > o.x && r.y < o.y + o.h + M && r.y + r.h + M > o.y,
-  );
-  for (const m of [EXPAND_GAP, EXPAND_GAP * 2, EXPAND_GAP * 3.2, EXPAND_GAP * 4.6, EXPAND_GAP * 6.2]) {
-    for (const c of candidates(m)) {
-      if (!hit({ x: c.x, y: c.y, w: pw, h: ph })) return { x: Math.round(c.x), y: Math.round(c.y) };
-    }
+/* ---------------- 多选对齐 / 分布 ---------------- */
+export interface AlItem { id: string; x: number; y: number; w: number; h: number }
+export function distribute(items: AlItem[], axis: 'x' | 'y'): Map<string, { x: number; y: number }> {
+  const sorted = [...items].sort((a, b) => (axis === 'x' ? a.x - b.x : a.y - b.y));
+  const res = new Map<string, { x: number; y: number }>();
+  if (sorted.length < 3) { sorted.forEach((i) => res.set(i.id, { x: i.x, y: i.y })); return res; }
+  const first = sorted[0], last = sorted[sorted.length - 1];
+  const inner = sorted.slice(1, -1);
+  const span = axis === 'x' ? last.x - (first.x + first.w) : last.y - (first.y + first.h);
+  const innerSize = inner.reduce((a, i) => a + (axis === 'x' ? i.w : i.h), 0);
+  const gap = (span - innerSize) / (inner.length + 1);
+  let cursor = axis === 'x' ? first.x + first.w + gap : first.y + first.h + gap;
+  res.set(first.id, { x: first.x, y: first.y });
+  res.set(last.id, { x: last.x, y: last.y });
+  for (const i of inner) {
+    res.set(i.id, axis === 'x' ? { x: Math.round(cursor), y: i.y } : { x: i.x, y: Math.round(cursor) });
+    cursor += (axis === 'x' ? i.w : i.h) + gap;
   }
-  const fb = candidates(EXPAND_GAP)[0];
-  return { x: Math.round(fb.x), y: Math.round(fb.y) };
+  return res;
 }
 
 /* ---------------- 持久化 / 规范化 ---------------- */
-
-/* v2：子流程改为侧向浮动面板模型，旧版内联展开数据不兼容，直接弃用 */
-const LS_KEY = 'stateflow-studio.pages.v2';
-const FLOW_KINDS: FlowKind[] = ['start', 'process', 'decision', 'io', 'subprocess'];
+const LS_KEY = 'stateflow-studio.pages.v3';
+const FLOW_KINDS = ['start', 'process', 'decision', 'io', 'subprocess'] as const;
+const SHAPE_KEYS = Object.keys(SHAPE_COLORS);
 
 function normalizeFlowNodes(raw: unknown): FlowNode[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((n) => n && typeof n.id === 'string').map((n) => {
-    const kind: FlowKind = FLOW_KINDS.includes(n.kind as FlowKind) ? (n.kind as FlowKind) : 'process';
+    const kind = FLOW_KINDS.includes(n.kind) ? n.kind : 'process';
+    const colorKey = SHAPE_KEYS.includes(n.color) ? n.color : undefined;
+    const light = SHAPE_COLORS[(colorKey ?? 'indigo') as keyof typeof SHAPE_COLORS].light;
     const node: FlowNode = {
-      id: n.id, kind,
-      text: typeof n.text === 'string' ? n.text : '',
+      id: n.id, kind, text: typeof n.text === 'string' ? n.text : '',
       x: Number(n.x) || 0, y: Number(n.y) || 0,
       w: Number(n.w) || 120, h: Number(n.h) || 50,
-      fill: typeof n.fill === 'string' ? n.fill : FLOW_DEFAULTS[kind].fill,
-      stroke: typeof n.stroke === 'string' ? n.stroke : FLOW_DEFAULTS[kind].stroke,
+      color: (colorKey ?? 'indigo') as FlowNode['color'],
+      fill: typeof n.fill === 'string' ? n.fill : light.fill,
+      stroke: typeof n.stroke === 'string' ? n.stroke : light.stroke,
     };
     if (kind === 'subprocess') {
-      /* 修复旧版布局可能留下的负坐标：内部整体平移回内容区（仅当存在负值时） */
       let innerNodes = normalizeFlowNodes(n.inner?.nodes);
       if (innerNodes.length) {
         const minX = Math.min(...innerNodes.map((k) => k.x));
         const minY = Math.min(...innerNodes.map((k) => k.y));
-        if (minX < 0 || minY < 0) {
-          const dx = minX < 0 ? -minX : 0, dy = minY < 0 ? -minY : 0;
-          innerNodes = innerNodes.map((k) => ({ ...k, x: k.x + dx, y: k.y + dy }));
-        }
+        if (minX < 0 || minY < 0) innerNodes = innerNodes.map((k) => ({ ...k, x: k.x + (minX < 0 ? -minX : 0), y: k.y + (minY < 0 ? -minY : 0) }));
       }
-      node.inner = {
-        nodes: innerNodes,
-        edges: normalizeFlowEdges(n.inner?.edges),
-      };
-      if (n.expandPos && Number.isFinite(n.expandPos.x) && Number.isFinite(n.expandPos.y)) {
-        node.expandPos = { x: Number(n.expandPos.x), y: Number(n.expandPos.y) };
-      }
-      /* 展开状态必须有记忆位置才成立，否则视为收纳（下次展开时重新选址+内部自动布局） */
+      node.inner = { nodes: innerNodes, edges: normalizeFlowEdges(n.inner?.edges) };
+      if (n.expandPos && Number.isFinite(n.expandPos.x) && Number.isFinite(n.expandPos.y)) node.expandPos = { x: Number(n.expandPos.x), y: Number(n.expandPos.y) };
       node.expanded = n.expanded === true && !!node.expandPos;
     }
     return node;
   });
 }
-
 function normalizeFlowEdges(raw: unknown): FlowEdge[] {
   if (!Array.isArray(raw)) return [];
   return raw.filter((e) => e && typeof e.source === 'string' && typeof e.target === 'string')
-    .map((e) => ({ id: typeof e.id === 'string' ? e.id : nid('fe'), source: e.source, target: e.target, label: e.label || undefined }));
+    .map((e) => ({ id: typeof e.id === 'string' ? e.id : uid('fe'), source: e.source, target: e.target, label: e.label || undefined }));
 }
-
+function normalizeWb(raw: unknown): WbShape[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((w) => w && typeof w.id === 'string').map((w) => ({
+    id: w.id, kind: w.kind, x: Number(w.x) || 0, y: Number(w.y) || 0, w: Number(w.w) || 100, h: Number(w.h) || 80,
+    color: SHAPE_KEYS.includes(w.color) ? w.color : undefined,
+    fill: typeof w.fill === 'string' ? w.fill : 'none',
+    stroke: typeof w.stroke === 'string' ? w.stroke : '#64748b',
+    strokeWidth: Number(w.strokeWidth) || 2,
+    text: typeof w.text === 'string' ? w.text : undefined,
+    src: typeof w.src === 'string' ? w.src : undefined,
+  }));
+}
+function normalizeStates(raw: unknown): ProjectState[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((s) => s && typeof s.id === 'string').map((s) => ({
+    id: s.id, name: typeof s.name === 'string' ? s.name : 'State',
+    kind: ['state', 'terminal', 'junction', 'start'].includes(s.kind) ? s.kind : 'state',
+    entry: s.entry || undefined, during: s.during || undefined, exit: s.exit || undefined, note: s.note || undefined,
+    color: (['indigo', 'blue', 'teal', 'green', 'amber', 'rose', 'violet', 'slate'].includes(s.color) ? s.color : 'indigo'),
+    position: { x: Number(s.position?.x) || 0, y: Number(s.position?.y) || 0 },
+  }));
+}
+function normalizeTransitions(raw: unknown): ProjectTransition[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((t) => t && typeof t.id === 'string' && typeof t.source === 'string' && typeof t.target === 'string').map((t) => ({
+    id: t.id, source: t.source, target: t.target,
+    event: t.event || undefined, condition: t.condition || undefined,
+    conditionAction: t.conditionAction || undefined, transitionAction: t.transitionAction || undefined,
+    enabled: t.enabled !== false, note: t.note || undefined,
+    lineWidth: typeof t.lineWidth === 'number' ? t.lineWidth : undefined,
+    dashed: t.dashed === true, lineColor: t.lineColor || undefined,
+    lineStyle: ['bezier', 'smoothstep', 'orthogonal', 'straight'].includes(t.lineStyle) ? t.lineStyle : undefined,
+    bend: typeof t.bend === 'number' ? t.bend : undefined,
+  }));
+}
 function normalizePage(raw: unknown, i: number): Page {
   const p = (raw ?? {}) as Partial<Page>;
   const base = makePage(p.type === 'whiteboard' ? 'whiteboard' : 'canvas', typeof p.name === 'string' && p.name ? p.name : `页面 ${i + 1}`);
   base.id = typeof p.id === 'string' ? p.id : base.id;
-  base.states = Array.isArray(p.states) ? p.states : [];
-  base.transitions = Array.isArray(p.transitions) ? p.transitions : [];
+  base.states = normalizeStates(p.states);
+  base.transitions = normalizeTransitions(p.transitions);
   base.flowNodes = normalizeFlowNodes(p.flowNodes);
   base.flowEdges = normalizeFlowEdges(p.flowEdges);
   base.flowDir = p.flowDir === 'LR' ? 'LR' : 'TB';
-  base.wbShapes = Array.isArray(p.wbShapes) ? p.wbShapes : [];
-  return base;
+  base.wbShapes = normalizeWb(p.wbShapes);
+  return ensureStartNode(base);
 }
-
 export function normalizeStudio(raw: unknown): StudioDoc {
   const d = (raw ?? {}) as Partial<StudioDoc>;
-  if (d.version !== 2 || !Array.isArray(d.pages) || !d.pages.length) throw new Error('bad doc');
+  if (!Array.isArray(d.pages) || !d.pages.length) throw new Error('bad doc');
   const pages = d.pages.map(normalizePage);
-  const base = defaultStudioDoc(typeof d.name === 'string' && d.name ? d.name : '未命名工程');
+  const st = (d.settings ?? {}) as Partial<StudioDoc['settings']>;
   return {
-    ...base,
-    settings: { ...base.settings, ...(d.settings ?? {}) },
+    version: 3,
+    name: typeof d.name === 'string' && d.name ? d.name : '未命名工程',
     pages,
     activePageId: pages.some((p) => p.id === d.activePageId) ? (d.activePageId as string) : pages[0].id,
+    settings: { ...defaultSettings(st.theme === 'dark' ? 'dark' : 'light'), ...st, theme: st.theme === 'dark' ? 'dark' : 'light' },
   };
 }
-
-export function loadStudio(): StudioDoc {
+export function loadStudio(initialTheme: ThemeMode): StudioDoc {
   try {
     const raw = localStorage.getItem(LS_KEY);
-    if (!raw) return sampleStudioDoc();
-    return normalizeStudio(JSON.parse(raw));
-  } catch {
-    return sampleStudioDoc();
-  }
+    if (raw) return normalizeStudio(JSON.parse(raw));
+  } catch { /* 损坏则回退示例 */ }
+  return sampleDoc(initialTheme);
 }
-
 export function saveStudio(doc: StudioDoc) {
-  try { localStorage.setItem(LS_KEY, JSON.stringify(doc)); } catch { /* 图片过大等情形静默 */ }
+  try { localStorage.setItem(LS_KEY, JSON.stringify(doc)); } catch { /* 忽略配额错误 */ }
 }
 
-/* ---------------- 示例工程（含递归子流程演示） ---------------- */
-
-export function sampleStudioDoc(): StudioDoc {
-  const page = makePage('canvas', '主流程');
-  /* 状态机：三状态 + 带标签转移 */
-  const s1 = makeSmState('state', 60, 30, '空闲');
-  const s2 = makeSmState('state', 330, 30, '运行中');
-  const s3 = makeSmState('terminal', 600, 30, '完成');
-  s1.entry = 'init();'; s2.during = 'poll();';
-  page.states = [s1, s2, s3];
-  page.transitions = [
-    { id: nid('t'), source: s1.id, target: s2.id, event: 'START', condition: 'ready', transitionAction: 'run();', enabled: true },
-    { id: nid('t'), source: s2.id, target: s3.id, event: 'DONE', conditionAction: 'log();', enabled: true },
-    { id: nid('t'), source: s2.id, target: s1.id, event: 'STOP', transitionAction: 'halt();', enabled: true },
-  ];
-
-  /* 流程图：开始→计算A→[[计算过程B]]→计算C→结束；B 内含 开始→计算D→[[计算过程E]]→结束 */
-  const f = (kind: FlowKind, text: string) => { const n = makeFlowNode(kind, 0, 0); n.text = text; return n; };
-  const eStart = f('start', '开始');
-  const eA = f('process', '计算 A');
-  const eB = f('subprocess', '计算过程 B');
-  const eC = f('process', '计算 C');
-  const eEnd = f('start', '结束');
-  const dStart = f('start', '开始');
-  const dD = f('process', '计算 D');
-  const dE = f('subprocess', '计算过程 E');
-  const dEnd = f('start', '结束');
-  const gStart = f('start', '开始');
-  const gF = f('process', '计算 F');
-  const gEnd = f('start', '结束');
-  /* 最内层 E：默认收纳 */
-  dE.inner = { nodes: [gStart, gF, gEnd], edges: [
-    { id: nid('fe'), source: gStart.id, target: gF.id },
-    { id: nid('fe'), source: gF.id, target: gEnd.id, label: '完成' },
-  ] };
-  dE.expanded = false;
-  eB.inner = { nodes: [dStart, dD, dE, dEnd], edges: [
-    { id: nid('fe'), source: dStart.id, target: dD.id },
-    { id: nid('fe'), source: dD.id, target: dE.id },
-    { id: nid('fe'), source: dE.id, target: dEnd.id },
-  ] };
-  eB.expanded = false;
-  const topNodes = [eStart, eA, eB, eC, eEnd];
-  const topEdges: FlowEdge[] = [
-    { id: nid('fe'), source: eStart.id, target: eA.id },
-    { id: nid('fe'), source: eA.id, target: eB.id },
-    { id: nid('fe'), source: eB.id, target: eC.id },
-    { id: nid('fe'), source: eC.id, target: eEnd.id },
-  ];
-  /* 主流程默认纵向（TB）排列 */
-  let laid = layoutFlowGraph(topNodes, topEdges, 'TB')
-    .map((n) => ({ ...n, x: n.x + 300, y: n.y + 260 }));
-  /* 展开 [[计算过程 B]]：内部自动布局 + 侧向（右/左）碰撞避让选址（演示浮动面板） */
-  const bNode = laid.find((n) => n.id === eB.id)!;
-  const bLaid = layoutInner(bNode, 'TB');
-  const bPanel = panelSize(bLaid);
-  const bObs = laid.filter((n) => n.id !== eB.id).map((n) => ({ x: n.x, y: n.y, w: n.w, h: n.h }));
-  const bPos = computeExpandPos(bNode, bPanel.w, bPanel.h, bObs, 'TB');
-  laid = laid.map((n) => (n.id === eB.id ? { ...bLaid, expanded: true, expandPos: bPos } : n));
-  page.flowNodes = laid;
-  page.flowEdges = topEdges;
-
-  /* 白板页 */
-  const wb = makePage('whiteboard', '灵感白板');
-  const note = makeWbShape('rect', 120, 120);
-  note.text = '白板页：插入图片后可在其上叠加形状标注'; note.w = 260; note.h = 90;
-  note.fill = 'rgba(245,158,11,0.18)'; note.stroke = '#f59e0b';
-  const oval = makeWbShape('ellipse', 460, 140);
-  oval.fill = 'rgba(168,85,247,0.15)'; oval.stroke = '#a855f7'; oval.w = 150; oval.h = 90;
-  const txt = makeWbShape('text', 130, 260);
-  txt.text = '箭头 / 直线 / 矩形 / 椭圆 / 文字皆可叠加'; txt.w = 320;
-  wb.wbShapes = [note, oval, txt];
-
-  return {
-    version: 2, name: 'StateFlow · 演示工程', settings: defaultSettings(),
-    pages: [page, wb], activePageId: page.id,
+/* ---------------- 示例工程 ---------------- */
+export function sampleDoc(theme: ThemeMode): StudioDoc {
+  const page = makePage('canvas', '交通信号灯');
+  const st = (name: string, kind: ProjectState['kind'], x: number, y: number, color: ProjectState['color'], extra?: Partial<ProjectState>) => {
+    const s: ProjectState = { id: uid('s'), name, kind, color, position: { x, y }, ...extra };
+    page.states.push(s); return s;
   };
+  const red = st('红灯', 'state', 240, 120, 'rose', { during: 'lamp = RED;', entry: 'cnt = 0;' });
+  const green = st('绿灯', 'state', 520, 120, 'green', { during: 'lamp = GREEN;' });
+  const yellow = st('黄灯', 'state', 520, 320, 'amber', { during: 'lamp = YELLOW;' });
+  const off = st('关闭', 'terminal', 240, 320, 'slate');
+  const tr = (source: string, target: string, parts: Partial<ProjectTransition>) =>
+    page.transitions.push({ id: uid('t'), source, target, enabled: true, ...parts });
+  tr('__missing__', red.id, {}); // 占位，稍后替换为 start
+  page.transitions.pop();
+  const startTr: ProjectTransition = { id: uid('t'), source: '__start__', target: red.id, enabled: true };
+  page.transitions.push(startTr);
+  tr(red.id, green.id, { event: 'TICK', condition: 'cnt >= 30', conditionAction: 'cnt = 0;', transitionAction: 'next();' });
+  tr(green.id, yellow.id, { event: 'TICK', condition: 'cnt >= 25', transitionAction: 'next();' });
+  tr(yellow.id, red.id, { event: 'TICK', condition: 'cnt >= 5', transitionAction: 'next();' });
+  tr(red.id, red.id, { event: 'TICK', condition: 'cnt < 30', conditionAction: 'cnt++;' });
+  tr(red.id, off.id, { event: 'CMD_OFF' });
+  tr(off.id, red.id, { event: 'CMD_ON', transitionAction: 'reset();' });
+  const p2 = makePage('whiteboard', '白板');
+  const doc: StudioDoc = { version: 3, name: '交通信号灯', pages: [ensureStartNode(page), p2], activePageId: page.id, settings: defaultSettings(theme) };
+  return doc;
 }
