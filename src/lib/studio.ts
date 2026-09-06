@@ -1,8 +1,8 @@
 /* ============================================================
  * studio —— 流程图布局 / 子流程浮动面板 / 多选对齐 / 持久化 / 规范化 / 示例
  * ============================================================ */
-import type { FlowNode, FlowEdge, InnerFlow, Page, PageType, StudioDoc, ThemeMode, WbShape, ProjectState, ProjectTransition } from './core';
-import { makePage, uid, SHAPE_COLORS, defaultSettings, ensureStartNode } from './core';
+import type { FlowNode, FlowEdge, FlowKind, InnerFlow, Page, PageType, StudioDoc, ThemeMode, WbShape, ProjectState, ProjectTransition } from './core';
+import { makePage, makeFlowNode, uid, SHAPE_COLORS, defaultSettings, ensureStartNode } from './core';
 
 export type Dir = 'LR' | 'TB';
 export interface Rect { x: number; y: number; w: number; h: number }
@@ -220,7 +220,7 @@ export function distribute(items: AlItem[], axis: 'x' | 'y'): Map<string, { x: n
 }
 
 /* ---------------- 持久化 / 规范化 ---------------- */
-const LS_KEY = 'stateflow-studio.pages.v3';
+const LS_KEY = 'stateflow-studio.pages.v4';
 const FLOW_KINDS = ['start', 'process', 'decision', 'io', 'subprocess'] as const;
 const SHAPE_KEYS = Object.keys(SHAPE_COLORS);
 
@@ -351,7 +351,62 @@ export function sampleDoc(theme: ThemeMode): StudioDoc {
   tr(red.id, red.id, { event: 'TICK', condition: 'cnt < 30', conditionAction: 'cnt++;' });
   tr(red.id, off.id, { event: 'CMD_OFF' });
   tr(off.id, red.id, { event: 'CMD_ON', transitionAction: 'reset();' });
+
+  /* ---------- 流程图示例页：纵向主链 + 两层嵌套子流程（B 默认展开） ---------- */
+  const flowPage = buildFlowSample();
+
   const p2 = makePage('whiteboard', '白板');
-  const doc: StudioDoc = { version: 3, name: '交通信号灯', pages: [ensureStartNode(page), p2], activePageId: page.id, settings: defaultSettings(theme) };
+  const doc: StudioDoc = {
+    version: 3, name: 'StateFlow 示例',
+    pages: [ensureStartNode(page), flowPage, p2],
+    activePageId: flowPage.id,
+    settings: defaultSettings(theme),
+  };
   return doc;
+}
+
+/** 订单处理流程：开始→录入订单→[[核算流程B]]→计算C→结束；B 内含分支判定与 [[核算流程E]] */
+function buildFlowSample(): Page {
+  const flow = makePage('canvas', '订单处理流程');
+  flow.flowDir = 'TB';
+  const fk = (kind: FlowKind, text: string) => { const n = makeFlowNode(kind, 0, 0); n.text = text; return n; };
+  const fe = (source: string, target: string, label?: string): FlowEdge =>
+    ({ id: uid('fe'), source, target, ...(label ? { label } : {}) });
+
+  // 最内层 E：开始 → 计算 F → 结束
+  const gS = fk('start', '开始'), gF = fk('process', '计算 F'), gEnd = fk('start', '结束');
+  const gEdges: FlowEdge[] = [fe(gS.id, gF.id), fe(gF.id, gEnd.id, '完成')];
+  const eN = fk('subprocess', '核算流程 E');
+  eN.inner = { nodes: layoutFlowGraph([gS, gF, gEnd], gEdges, 'TB'), edges: gEdges };
+  eN.expanded = false;
+
+  // B 内部：开始 → 计算 D → 判定 →(是) [[E]] → 结束；判定 →(否) 结束
+  const dS = fk('start', '开始'), dD = fk('process', '计算 D'), dQ = fk('decision', 'D 完成?'), dEnd = fk('start', '结束');
+  const dEdges: FlowEdge[] = [
+    fe(dS.id, dD.id), fe(dD.id, dQ.id),
+    fe(dQ.id, eN.id, '是'), fe(eN.id, dEnd.id),
+    fe(dQ.id, dEnd.id, '否'),
+  ];
+  const bN = fk('subprocess', '核算流程 B');
+  bN.inner = { nodes: layoutFlowGraph([dS, dD, dQ, eN, dEnd], dEdges, 'TB'), edges: dEdges };
+  bN.expanded = false;
+
+  // 顶层：开始 → 录入订单 → [[B]] → 计算 C → 结束
+  const tS = fk('start', '开始'), tA = fk('io', '录入订单'), tC = fk('process', '计算 C'), tEnd = fk('start', '结束');
+  const tEdges: FlowEdge[] = [
+    fe(tS.id, tA.id), fe(tA.id, bN.id),
+    fe(bN.id, tC.id, '核算通过'), fe(tC.id, tEnd.id),
+  ];
+  const topNodes = layoutFlowGraph([tS, tA, bN, tC, tEnd], tEdges, 'TB')
+    .map((n) => ({ ...n, x: n.x + 120, y: n.y + 60 }));
+
+  // 展开 B：内部已布局，面板向右避让顶层链路
+  flow.flowNodes = topNodes.map((n) => {
+    if (n.id !== bN.id) return n;
+    const ps = panelSize(n);
+    const obstacles = topNodes.filter((m) => m.id !== n.id).map((m) => ({ x: m.x, y: m.y, w: m.w, h: m.h }));
+    return { ...n, expanded: true, expandPos: computeExpandPos(n, ps.w, ps.h, obstacles, 'TB') };
+  });
+  flow.flowEdges = tEdges;
+  return flow;
 }
