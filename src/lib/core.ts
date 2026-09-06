@@ -78,6 +78,13 @@ export function resolveShapeColor(
   return p ? { fill: p.fill, stroke: p.stroke } : { fill, stroke };
 }
 
+/** 安全取色：color 键无效时回退到 indigo，绝不抛错（防止坏数据导致白屏） */
+export function shapePair(color: string | undefined, theme: ThemeMode): { fill: string; stroke: string } {
+  const key = (color && SHAPE_COLORS[color as ShapeColorKey]) ? (color as ShapeColorKey) : 'indigo';
+  const p = SHAPE_COLORS[key][theme];
+  return { fill: p.fill, stroke: p.stroke };
+}
+
 /** 依据填充色亮度返回适合叠加的文字色（保证任何主题下可读） */
 export function readableOn(fill: string): string {
   const h = (fill || '').replace('#', '');

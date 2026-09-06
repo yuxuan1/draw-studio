@@ -20,7 +20,7 @@ import type {
   OnSelectionChangeParams,
 } from '@xyflow/react';
 import { useScope } from '../store/scopeStore';
-import { THEME, SHAPE_COLORS, readableOn, FONT_STACK } from '../lib/core';
+import { THEME, SHAPE_COLORS, shapePair, readableOn, FONT_STACK } from '../lib/core';
 import type { ThemeMode } from '../lib/core';
 import type { RenderNode, Handle as FFHandle, ID, CallNode } from '../lib/domain';
 import { NODE_DEFAULTS, buildProjectCallGraph, OVERVIEW_CARD } from '../lib/domain';
@@ -38,8 +38,7 @@ const HANDLE_SIDES: { side: FFHandle; pos: Position }[] = [
 function FFNode({ data }: NodeProps) {
   const { node: n, theme, editable, selected } = data as unknown as FFNodeData;
   const th = THEME[theme];
-  const key = ((n.properties?.color as string) ?? NODE_DEFAULTS[n.type].color) as keyof typeof SHAPE_COLORS;
-  const { fill, stroke } = SHAPE_COLORS[key][theme];
+  const { fill, stroke } = shapePair((n.properties?.color as string) ?? NODE_DEFAULTS[n.type].color, theme);
   const text = readableOn(fill);
   const isDiamond = n.type === 'decision' || n.type === 'choice';
   const isStadium = n.type === 'start' || n.type === 'end';
@@ -149,12 +148,15 @@ function CanvasInner() {
       return callGraph.nodes.map((n, i) => ({
         id: n.id, type: 'ov',
         position: overviewPos[n.id] ?? { x: 0, y: 0 },
+        /* 显式尺寸：让 RF 不必依赖测量，避免 0×0 导致 fitView/边锚点计算异常 */
+        style: { width: OVERVIEW_CARD.w, height: OVERVIEW_CARD.h },
         data: { name: n.name, nodeCount: n.nodeCount, callCount: n.callCount, colorKey: OV_KEYS[i % OV_KEYS.length], theme: app.theme, selected: false },
       }));
     }
     return app.projection.nodes.map((n) => ({
       id: n.id, type: 'ff',
       position: { x: n.x, y: n.y },
+      style: { width: n.w, height: n.h },
       data: { node: n, theme: app.theme, editable, selected: app.sel.kind === 'node' && app.sel.ids.includes(n.id) },
     }));
   }, [app.viewKind, callGraph, overviewPos, app.projection, app.theme, editable, app.sel]);
@@ -216,17 +218,25 @@ function CanvasInner() {
     setRenaming({ id: n.id, x: sp.x, y: sp.y, w: n.w });
   }, [app, editable, rf]);
 
-  /* 外部适应视图请求（自动布局 / 返回上级等） */
+  /* 始终读取最新 nodes（供延迟回调使用，不进入依赖） */
+  const nodesRef = useRef(nodes);
+  nodesRef.current = nodes;
+
+  /* 适应视图：切换 Scope/视图、外部请求（自动布局/返回）、首次挂载时执行。
+     延迟到 RF 完成节点测量后再适配，且只在有节点时执行，
+     避免在空集/未测量状态下 fitView 计算出异常视口导致画面消失。 */
   useEffect(() => {
-    if (app.fitSignal) rf.fitView({ padding: 0.15, duration: 220 });
-  }, [app.fitSignal, rf]);
+    const t = setTimeout(() => {
+      if (nodesRef.current.length) rf.fitView({ padding: 0.15, maxZoom: 1.4, duration: 200 });
+    }, 60);
+    return () => clearTimeout(t);
+  }, [scopeKey, app.fitSignal, rf]);
 
   const page = app.project.pages.find((p) => p.id === app.scope.pageId);
 
   return (
     <div className="relative flex-1 min-w-0 overflow-hidden" style={{ background: th.canvas }}>
       <ReactFlow
-        key={scopeKey}
         nodes={nodes} edges={edges} nodeTypes={nodeTypes}
         onNodesChange={onNodesChange}
         onSelectionChange={onSelectionChange}
@@ -237,11 +247,10 @@ function CanvasInner() {
         nodesConnectable={editable}
         edgesReconnectable={false}
         deleteKeyCode={null}
-        fitView
-        fitViewOptions={{ padding: 0.15, maxZoom: 1.4 }}
         minZoom={0.15} maxZoom={2.5}
         connectionLineStyle={{ stroke: th.sel, strokeWidth: 2, strokeDasharray: '6 4' }}
         connectionRadius={36}
+        proOptions={{ hideAttribution: false }}
       >
         <Background variant={BackgroundVariant.Dots} gap={24} size={1.3} color={th.dot} />
       </ReactFlow>

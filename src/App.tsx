@@ -1,7 +1,8 @@
 /* ============================================================
  * App —— FlowForge 外壳：ScopeProvider + 顶栏 + 页面页签 + 三栏 + Toast
  * ============================================================ */
-import { useEffect, useState } from 'react';
+import { Component, useEffect, useState } from 'react';
+import type { ReactNode, ErrorInfo } from 'react';
 import { ScopeProvider, useScope } from './store/scopeStore';
 import ScopeCanvas from './components/ScopeCanvas';
 import { LeftPanel, Inspector } from './components/ScopePanels';
@@ -9,11 +10,37 @@ import { THEME, SHAPE_COLORS } from './lib/core';
 import { NODE_DEFAULTS, NODE_TYPE_LABEL } from './lib/domain';
 import type { NodeType } from './lib/domain';
 
+/* 错误边界：任何渲染异常都不会白屏，给出可恢复的提示 */
+class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: ErrorInfo) { console.error('[FlowForge] 渲染异常:', error, info.componentStack); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="h-screen w-screen flex items-center justify-center" style={{ background: 'var(--app-bg)', color: 'var(--text)' }}>
+          <div className="max-w-md rounded-xl p-6 text-center" style={{ background: 'var(--panel)', border: '1px solid var(--border)', boxShadow: 'var(--shadow)' }}>
+            <div className="text-[16px] font-extrabold mb-2">界面渲染出错了</div>
+            <div className="text-[12px] mb-4 break-all" style={{ color: 'var(--muted)' }}>{String(this.state.error)}</div>
+            <div className="flex gap-2 justify-center">
+              <button className="btn" onClick={() => this.setState({ error: null })}>重试</button>
+              <button className="btn" onClick={() => { localStorage.clear(); location.reload(); }}>清空本地数据并重载</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function App() {
   return (
-    <ScopeProvider>
-      <Shell />
-    </ScopeProvider>
+    <ErrorBoundary>
+      <ScopeProvider>
+        <Shell />
+      </ScopeProvider>
+    </ErrorBoundary>
   );
 }
 
