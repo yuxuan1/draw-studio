@@ -315,16 +315,19 @@ export function layoutMini(process: Process): MiniLayout {
   return { nodes: [...pos.values()], edges, width: maxW + PAD, height: maxH + PAD };
 }
 
-/* ---------------- 层级自动布局（hierarchical，TB 方向） ----------------
-   首次进入无布局的 Scope 调用一次；结果写回 ScopeLayout 后绝不自动重排（红线）。 */
-export function layoutProcess(process: Process): Record<ID, Position> {
+/* ---------------- 通用分层布局（hierarchical，TB 方向） ----------------
+   流程图 Scope 与全局调用图共用同一套算法（Kahn 分层 + 重心排序减交叉）。 */
+export function layoutLayered(
+  items: { id: ID; w: number; h: number }[],
+  edges: { source: ID; target: ID }[],
+): Record<ID, Position> {
   const NODE_GAP = 44;      // 同层节点间距
   const LAYER_GAP = 52;     // 层间距
   const indeg = new Map<ID, number>();
   const out = new Map<ID, ID[]>();
-  const byId = new Map(process.nodes.map((n) => [n.id, n]));
-  process.nodes.forEach((n) => { indeg.set(n.id, 0); out.set(n.id, []); });
-  process.edges.forEach((e) => {
+  const byId = new Map(items.map((n) => [n.id, n]));
+  items.forEach((n) => { indeg.set(n.id, 0); out.set(n.id, []); });
+  edges.forEach((e) => {
     if (indeg.has(e.target) && byId.has(e.source)) {
       indeg.set(e.target, (indeg.get(e.target) ?? 0) + 1);
       out.get(e.source)!.push(e.target);
@@ -332,7 +335,7 @@ export function layoutProcess(process: Process): Record<ID, Position> {
   });
   // Kahn 分层
   const layer = new Map<ID, number>();
-  let frontier = process.nodes.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id);
+  let frontier = items.filter((n) => (indeg.get(n.id) ?? 0) === 0).map((n) => n.id);
   const placed = new Set<ID>();
   let depth = 0;
   while (frontier.length) {
@@ -344,11 +347,11 @@ export function layoutProcess(process: Process): Record<ID, Position> {
     }));
     frontier = next; depth++;
   }
-  process.nodes.forEach((n) => { if (!layer.has(n.id)) layer.set(n.id, depth); });
+  items.forEach((n) => { if (!layer.has(n.id)) layer.set(n.id, depth); });
 
   // 重心排序减交叉：每层按父层平均 x 排序
   const byLayer = new Map<number, ID[]>();
-  process.nodes.forEach((n) => {
+  items.forEach((n) => {
     const l = layer.get(n.id) ?? 0;
     if (!byLayer.has(l)) byLayer.set(l, []);
     byLayer.get(l)!.push(n.id);
@@ -360,7 +363,7 @@ export function layoutProcess(process: Process): Record<ID, Position> {
     const ids = byLayer.get(layers[li])!;
     const bary = new Map<ID, number>();
     ids.forEach((id) => {
-      const parents = process.edges.filter((e) => e.target === id && layer.get(e.source) === layers[li - 1]);
+      const parents = edges.filter((e) => e.target === id && layer.get(e.source) === layers[li - 1]);
       if (parents.length) {
         bary.set(id, parents.reduce((a, e) => a + (order.get(e.source) ?? 0), 0) / parents.length);
       } else bary.set(id, order.get(id) ?? 0);
@@ -375,20 +378,50 @@ export function layoutProcess(process: Process): Record<ID, Position> {
   let y = 60;
   layers.forEach((l) => {
     const ids = byLayer.get(l)!;
-    const widths = ids.map((id) => NODE_DEFAULTS[byId.get(id)!.type].w);
+    const widths = ids.map((id) => byId.get(id)!.w);
     const totalW = widths.reduce((a, b) => a + b, 0) + NODE_GAP * (ids.length - 1);
     let x = 60 + Math.max(0, (600 - totalW) / 2);
     let maxH = 0;
-    ids.forEach((id, i) => {
-      const n = byId.get(id)!;
-      const d = NODE_DEFAULTS[n.type];
+    ids.forEach((id) => {
+      const it = byId.get(id)!;
       pos[id] = { x: Math.round(x), y: Math.round(y) };
-      x += d.w + NODE_GAP;
-      maxH = Math.max(maxH, d.h);
+      x += it.w + NODE_GAP;
+      maxH = Math.max(maxH, it.h);
     });
     y += maxH + LAYER_GAP;
   });
   return pos;
+}
+
+/** 流程 Scope 布局（首次进入无布局的 Scope 调用一次；写回后绝不自动重排） */
+export function layoutProcess(process: Process): Record<ID, Position> {
+  return layoutLayered(
+    process.nodes.map((n) => ({ id: n.id, w: NODE_DEFAULTS[n.type].w, h: NODE_DEFAULTS[n.type].h })),
+    process.edges,
+  );
+}
+
+/** 全局调用图布局（Overview，存于 layouts['__overview']） */
+export const OVERVIEW_CARD = { w: 196, h: 66 };
+export function layoutCallGraph(g: { nodes: CallGraphNode[]; edges: CallGraphEdge[] }): Record<ID, Position> {
+  return layoutLayered(
+    g.nodes.map((n) => ({ id: n.id, w: OVERVIEW_CARD.w, h: OVERVIEW_CARD.h })),
+    g.edges,
+  );
+}
+
+/* ---------------- 函数引用反查（called-by，函数库用） ---------------- */
+export interface CalledByRef { processId: ID; processName: string; nodeId: ID; nodeName: string }
+export function calledBy(project: Project, functionId: ID): CalledByRef[] {
+  const out: CalledByRef[] = [];
+  for (const p of project.processes) {
+    for (const n of p.nodes) {
+      if (n.type === 'reference' && (n as ReferenceNode).functionId === functionId) {
+        out.push({ processId: p.id, processName: p.name, nodeId: n.id, nodeName: n.name });
+      }
+    }
+  }
+  return out;
 }
 
 /* ---------------- 默认 / 示例工程 ---------------- */
@@ -396,14 +429,25 @@ export function defaultProject(theme: 'light' | 'dark' = 'light'): Project {
   const main = makeSampleMain();
   const page: Page = { id: uid('pg'), name: '主流程', type: 'flow', order: 0, rootProcessId: main.processes[0].id };
   return {
-    format: 'flowforge', version: 1, id: uid('proj'), name: '未命名工程',
-    pages: [page], functions: [], processes: main.processes, stateMachines: [],
+    format: 'flowforge', version: 1, id: uid('proj'), name: '订单系统',
+    pages: [page], functions: main.functions, processes: main.processes, stateMachines: [],
     settings: { theme },
   };
 }
 
-/** 示例：main → 计算A → call(核算B) → call(核算E 嵌在 B 内) 多层 */
-export function makeSampleMain(): { processes: Process[] } {
+/** 示例：main → 计算A → call(核算B) → call(核算E 嵌在 B 内) 多层；含共享函数引用 */
+export function makeSampleMain(): { processes: Process[]; functions: Function[] } {
+  // 公共函数（单实体，多处 Reference 引用）
+  const fCalc: Function = {
+    id: uid('fn'), name: '计算价格', namespace: 'pricing', type: 'shared',
+    description: '根据订单类型与折扣策略计算最终价格',
+    parameters: [{ name: 'order', type: 'Order', direction: 'in' }], returnType: 'number',
+  };
+  const fLog: Function = {
+    id: uid('fn'), name: '记录日志', namespace: 'util', type: 'library',
+    description: '写入审计日志（异步，不阻塞主流程）',
+    parameters: [{ name: 'msg', type: 'string', direction: 'in' }], returnType: 'void',
+  };
   // 最内层 E：开始 → 计算F → 结束
   const eS = makeNode('start', 0, 0); eS.name = '开始';
   const eF = makeNode('action', 0, 80); eF.name = '计算 F';
@@ -419,17 +463,20 @@ export function makeSampleMain(): { processes: Process[] } {
   const callE: CallNode = { ...makeNode('call', 0, 240), targetProcessId: procE.id, displayMode: 'collapsed' } as CallNode;
   callE.name = '核算流程 E';
 
-  // B：开始 → 计算D → 判定 → call(E) → 结束 ；判定 →(否) 结束
+  // B：开始 → 计算D → 引用(记录日志) → 判定 → call(E) → 结束 ；判定 →(否) 结束
   const bS = makeNode('start', 0, 0); bS.name = '开始';
   const bD = makeNode('action', 0, 80); bD.name = '计算 D';
+  const bLog: ReferenceNode = { ...makeNode('reference', 0, 0), functionId: fLog.id } as ReferenceNode;
+  bLog.name = '记录日志';
   const bQ = makeNode('decision', 0, 160); bQ.name = 'D 完成?';
   const bE = makeNode('end', 0, 320); bE.name = '结束';
   const procB: Process = {
     id: uid('pr'), name: '核算流程 B',
-    nodes: [bS, bD, bQ, callE, bE],
+    nodes: [bS, bD, bLog, bQ, callE, bE],
     edges: [
       { id: uid('e'), type: 'flow', source: bS.id, target: bD.id },
-      { id: uid('e'), type: 'flow', source: bD.id, target: bQ.id },
+      { id: uid('e'), type: 'flow', source: bD.id, target: bLog.id },
+      { id: uid('e'), type: 'flow', source: bLog.id, target: bQ.id },
       { id: uid('e'), type: 'flow', source: bQ.id, target: callE.id, label: '是' },
       { id: uid('e'), type: 'flow', source: callE.id, target: bE.id },
       { id: uid('e'), type: 'flow', source: bQ.id, target: bE.id, label: '否', style: { type: 'step', dashed: true } },
@@ -438,22 +485,25 @@ export function makeSampleMain(): { processes: Process[] } {
   const callB: CallNode = { ...makeNode('call', 0, 240), targetProcessId: procB.id, displayMode: 'collapsed' } as CallNode;
   callB.name = '核算流程 B';
 
-  // main：开始 → 录入订单 → call(B) → 计算C → 结束
+  // main：开始 → 录入订单 → 引用(计算价格) → call(B) → 计算C → 结束
   const mS = makeNode('start', 0, 0); mS.name = '开始';
   const mA = makeNode('action', 0, 80); mA.name = '录入订单';
+  const mCalc: ReferenceNode = { ...makeNode('reference', 0, 0), functionId: fCalc.id } as ReferenceNode;
+  mCalc.name = '计算价格';
   const mC = makeNode('action', 0, 320); mC.name = '计算 C';
   const mE = makeNode('end', 0, 400); mE.name = '结束';
   const procMain: Process = {
     id: uid('pr'), name: '订单处理',
-    nodes: [mS, mA, callB, mC, mE],
+    nodes: [mS, mA, mCalc, callB, mC, mE],
     edges: [
       { id: uid('e'), type: 'flow', source: mS.id, target: mA.id },
-      { id: uid('e'), type: 'flow', source: mA.id, target: callB.id },
+      { id: uid('e'), type: 'flow', source: mA.id, target: mCalc.id },
+      { id: uid('e'), type: 'flow', source: mCalc.id, target: callB.id },
       { id: uid('e'), type: 'flow', source: callB.id, target: mC.id, label: '核算通过' },
       { id: uid('e'), type: 'flow', source: mC.id, target: mE.id },
     ],
   };
-  return { processes: [procMain, procB, procE] };
+  return { processes: [procMain, procB, procE], functions: [fCalc, fLog] };
 }
 
 /* ---------------- 确定性序列化 / 反序列化 ---------------- */

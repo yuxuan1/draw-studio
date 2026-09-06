@@ -14,15 +14,19 @@ import type {
 } from '../lib/domain';
 import type { ThemeMode } from '../lib/core';
 import {
-  defaultProject, uid, projectProcess, layoutProcess, NODE_DEFAULTS, makeNode,
-  serializeProject, deserializeProject,
+  defaultProject, uid, projectProcess, layoutProcess, layoutCallGraph, buildProjectCallGraph,
+  NODE_DEFAULTS, makeNode, serializeProject, deserializeProject, calledBy, OVERVIEW_CARD,
 } from '../lib/domain';
+import type { Function as FnDef, CallNode, ReferenceNode } from '../lib/domain';
 import type { Command } from '../lib/command';
 import { createHistory, execute, undo as hUndo, redo as hRedo, replaceCmd, batchCmd } from '../lib/command';
 
 export interface Sel { kind: null | 'node' | 'edge'; id: ID | null; ids: ID[] }
 export type SelInput = { kind: Sel['kind']; id?: ID | null; ids?: ID[] };
 export type Tool = 'select' | NodeType;
+export type AppMode = 'edit' | 'read';
+export type ViewKind = 'flow' | 'callgraph';
+export interface PaletteState { open: boolean; x: number; y: number; step: null | 'call' | 'reference' }
 interface Toast { id: number; msg: string; type: 'ok' | 'err' }
 
 /** Command 管理的状态：Domain + 布局（二者都是真源，渲染态可丢弃） */
@@ -57,7 +61,7 @@ function readDomTheme(): ThemeMode {
 interface ScopeCtx {
   project: Project; layouts: Record<ID, ScopeLayout>;
   scope: ScopeRef; scopeStack: ScopeRef[];
-  currentProcess: Process | null; projection: Projection;
+  page: Page; currentProcess: Process | null; projection: Projection;
   canUndo: boolean; canRedo: boolean; undo: () => void; redo: () => void;
   addNode: (type: NodeType, x: number, y: number) => void;
   deleteSel: () => void;
@@ -81,6 +85,17 @@ interface ScopeCtx {
   fitSignal: number; requestFit: () => void;
   savedAt: number;
   exportHandle: { current: null | ((bg: 'white' | 'transparent' | 'theme') => { svg: string; w: number; h: number } | null) };
+  /* 阅读 / 编辑模式 */
+  mode: AppMode; toggleMode: () => void;
+  /* P 键形状选择面板 */
+  palette: PaletteState; openPalette: () => void; closePalette: () => void; setPaletteStep: (s: PaletteState['step']) => void;
+  placeNode: (type: NodeType, opts?: { targetProcessId?: ID; functionId?: ID }) => void;
+  screenToWorldRef: { current: null | ((sx: number, sy: number) => Position) };
+  /* 全局调用图视图 */
+  viewKind: ViewKind; setViewKind: (v: ViewKind) => void;
+  moveOverviewNode: (id: ID, to: Position) => void;
+  /* 函数库 */
+  addFunction: () => void; renameFunction: (id: ID, name: string) => void; deleteFunction: (id: ID) => void;
 }
 
 const Ctx = createContext<ScopeCtx | null>(null);
@@ -345,8 +360,126 @@ export function ScopeProvider({ children }: { children: ReactNode }) {
     setSelState({ kind: s.kind, id: s.id ?? null, ids: s.ids ?? (s.id ? [s.id] : []) });
   }, []);
 
+  /* ---------- 阅读 / 编辑模式（视图态，不入 Undo） ---------- */
+  const [mode, setMode] = useState<AppMode>('edit');
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const toggleMode = useCallback(() => {
+    setMode((m) => {
+      const next = m === 'edit' ? 'read' : 'edit';
+      if (next === 'read') { setSelState({ kind: null, id: null, ids: [] }); setPreviewNodeId(null); }
+      return next;
+    });
+  }, []);
+
+  /* ---------- 鼠标位置追踪（P 键面板落点用） ---------- */
+  const mouseRef = useRef<{ x: number; y: number }>({ x: window.innerWidth / 2, y: window.innerHeight / 2 });
+  useEffect(() => {
+    const onMove = (e: PointerEvent) => { mouseRef.current = { x: e.clientX, y: e.clientY }; };
+    window.addEventListener('pointermove', onMove, { passive: true });
+    return () => window.removeEventListener('pointermove', onMove);
+  }, []);
+  const screenToWorldRef = useRef<ScopeCtx['screenToWorldRef']['current']>(null);
+
+  /* ---------- P 键形状选择面板 ---------- */
+  const [palette, setPalette] = useState<PaletteState>({ open: false, x: 0, y: 0, step: null });
+  const openPalette = useCallback(() => {
+    if (modeRef.current === 'read') { toast('阅读模式下不能添加节点', 'err'); return; }
+    const m = mouseRef.current;
+    /* 防止面板溢出屏幕边缘 */
+    const x = Math.min(m.x + 14, window.innerWidth - 260);
+    const y = Math.min(m.y + 10, window.innerHeight - 380);
+    setPalette({ open: true, x: Math.max(8, x), y: Math.max(8, y), step: null });
+  }, [toast]);
+  const closePalette = useCallback(() => setPalette((p) => ({ ...p, open: false, step: null })), []);
+  const setPaletteStep = useCallback((s: PaletteState['step']) => setPalette((p) => ({ ...p, step: s })), []);
+
+  /** 在按下 P 时的鼠标位置放置节点（世界坐标由画布注册的换算器求得） */
+  const placeNode = useCallback((type: NodeType, opts?: { targetProcessId?: ID; functionId?: ID }) => {
+    const pid = currentProcessId; if (!pid) return;
+    const conv = screenToWorldRef.current;
+    const m = mouseRef.current;
+    const w = conv ? conv(m.x, m.y) : { x: 200, y: 200 };
+    const d = NODE_DEFAULTS[type];
+    const extra: Record<string, unknown> = {};
+    if (type === 'call' && opts?.targetProcessId) {
+      const tgt = docRef.current.project.processes.find((p) => p.id === opts.targetProcessId);
+      Object.assign(extra, { targetProcessId: opts.targetProcessId, displayMode: 'collapsed', name: tgt?.name ?? '调用子流程' });
+    }
+    if (type === 'reference' && opts?.functionId) {
+      const fn = docRef.current.project.functions.find((f) => f.id === opts.functionId);
+      Object.assign(extra, { functionId: opts.functionId, name: fn?.name ?? '引用函数' });
+    }
+    const node = makeNode(type, 0, 0, extra as Partial<CallNode>);
+    const before = docRef.current;
+    const after: DocState = {
+      project: { ...before.project, processes: before.project.processes.map((p) => (p.id === pid ? { ...p, nodes: [...p.nodes, node] } : p)) },
+      layouts: {
+        ...before.layouts,
+        [pid]: {
+          ...(before.layouts[pid] ?? { positions: {}, viewport: { x: 0, y: 0, zoom: 1 }, locked: false, algorithm: 'manual' as const }),
+          positions: { ...(before.layouts[pid]?.positions ?? {}), [node.id]: { x: Math.round(w.x - d.w / 2), y: Math.round(w.y - d.h / 2) } },
+        },
+      },
+    };
+    run(replaceCmd('新增节点', before, after));
+    setSelState({ kind: 'node', id: node.id, ids: [node.id] });
+    setPalette({ open: false, x: 0, y: 0, step: null });
+  }, [currentProcessId, run]);
+
+  /* ---------- 全局调用图（Overview） ---------- */
+  const [viewKind, setViewKindState] = useState<ViewKind>('flow');
+  const setViewKind = useCallback((v: ViewKind) => {
+    setViewKindState(v);
+    if (v === 'callgraph') {
+      /* 首次打开无布局 → 自动布局一次并写入（红线允许的"首次布局"） */
+      const st = docRef.current;
+      if (!st.layouts['__overview']) {
+        const g = buildProjectCallGraph(st.project);
+        const positions = g.nodes.length ? layoutCallGraph(g) : {};
+        const after: DocState = {
+          ...st,
+          layouts: { ...st.layouts, __overview: { positions, viewport: { x: 0, y: 0, zoom: 1 }, locked: false, algorithm: 'hierarchical' } },
+        };
+        setHist((h) => execute(h, replaceCmd('全局视图布局', st, after)));
+      }
+      setFitSignal((n) => n + 1);
+    }
+    setSelState({ kind: null, id: null, ids: [] });
+    setPreviewNodeId(null);
+  }, []);
+  const moveOverviewNode = useCallback((id: ID, to: Position) => {
+    const before = docRef.current;
+    const lay = before.layouts['__overview'] ?? { positions: {}, viewport: { x: 0, y: 0, zoom: 1 }, locked: false, algorithm: 'manual' as const };
+    const after: DocState = {
+      ...before,
+      layouts: { ...before.layouts, __overview: { ...lay, positions: { ...lay.positions, [id]: { x: Math.round(to.x), y: Math.round(to.y) } } } },
+    };
+    run(replaceCmd('移动流程卡片', before, after, `move:__overview__:${id}`));
+  }, [run]);
+
+  /* ---------- 函数库 ---------- */
+  const mutateProject = useCallback((label: string, fn: (p: Project) => Project) => {
+    const before = docRef.current;
+    run(replaceCmd(label, before, { ...before, project: fn(before.project) }));
+  }, [run]);
+  const addFunction = useCallback(() => {
+    const n = docRef.current.project.functions.length + 1;
+    const f: FnDef = { id: uid('fn'), name: `新函数 ${n}`, type: 'shared' };
+    mutateProject('新增函数', (p) => ({ ...p, functions: [...p.functions, f] }));
+    toast(`已创建「${f.name}」，可在流程图 P 面板中引用`);
+  }, [mutateProject, toast]);
+  const renameFunction = useCallback((id: ID, name: string) => {
+    mutateProject('重命名函数', (p) => ({ ...p, functions: p.functions.map((f) => (f.id === id ? { ...f, name } : f)) }));
+  }, [mutateProject]);
+  const deleteFunction = useCallback((id: ID) => {
+    const refs = calledBy(docRef.current.project, id);
+    if (refs.length) { toast(`该函数被 ${refs.length} 处引用，无法删除`, 'err'); return; }
+    mutateProject('删除函数', (p) => ({ ...p, functions: p.functions.filter((f) => f.id !== id) }));
+  }, [mutateProject, toast]);
+
   const value: ScopeCtx = {
-    project, layouts, scope, scopeStack, currentProcess, projection,
+    project, layouts, scope, scopeStack, page, currentProcess, projection,
     canUndo: hist.past.length > 0, canRedo: hist.future.length > 0, undo, redo,
     addNode, deleteSel, renameNode, moveNode, setNodeColor, setNodeType,
     createEdge, deleteEdge, setEdgeStyle, setEdgeLabel, autoLayout,
@@ -356,6 +489,10 @@ export function ScopeProvider({ children }: { children: ReactNode }) {
     previewNodeId, setPreviewNodeId, toasts, toast,
     addPage, deletePage, renamePage,
     fitSignal, requestFit, savedAt, exportHandle,
+    mode, toggleMode,
+    palette, openPalette, closePalette, setPaletteStep, placeNode, screenToWorldRef,
+    viewKind, setViewKind, moveOverviewNode,
+    addFunction, renameFunction, deleteFunction,
   };
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
