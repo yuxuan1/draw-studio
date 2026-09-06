@@ -4,15 +4,15 @@
  *  - 双击 call 进入子流程；面包屑/返回退出；单击 call 弹 mini 预览
  *  - 四锚点(t/b/l/r)拖线；框选；拖拽移动(合并 Undo)；滚轮缩放/平移
  * ============================================================ */
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useScope } from '../store/scopeStore';
 import type { Tool } from '../store/scopeStore';
 import { THEME, SHAPE_COLORS, readableOn, estWidth, wrapText, FONT_STACK } from '../lib/core';
 import type { ThemeMode } from '../lib/core';
 import type {
-  RenderNode, ProjectedEdge, Handle, NodeType, Position, ID, CallNode, MiniLayout, Process,
+  RenderNode, ProjectedEdge, Handle, NodeType, Position, ID, CallNode, Process,
 } from '../lib/domain';
-import { NODE_DEFAULTS, layoutMini, buildProjectCallGraph, OVERVIEW_CARD } from '../lib/domain';
+import { NODE_DEFAULTS, buildProjectCallGraph, OVERVIEW_CARD } from '../lib/domain';
 
 interface View { x: number; y: number; k: number }
 type Drag =
@@ -186,12 +186,12 @@ export default function ScopeCanvas() {
       capture(e);
       return;
     }
-    // 中键 / Ctrl+左键 平移；左键空白 = 框选（设计 5.2）
-    if (e.button === 1 || e.ctrlKey || e.metaKey) {
-      dragRef.current = { mode: 'pan', sx: p.x, sy: p.y, ox: view.x, oy: view.y };
-    } else {
+    // 左键拖动空白 = 平移画布（默认）；Shift+左键拖动 = 框选；中键/Ctrl+左键也可平移
+    if (e.button === 0 && e.shiftKey && editable) {
       dragRef.current = { mode: 'marquee', sx: p.x, sy: p.y, ex: p.x, ey: p.y };
       setMarquee({ x1: p.x, y1: p.y, x2: p.x, y2: p.y });
+    } else {
+      dragRef.current = { mode: 'pan', sx: p.x, sy: p.y, ox: view.x, oy: view.y };
     }
     capture(e);
   };
@@ -284,8 +284,6 @@ export default function ScopeCanvas() {
   const onNodeClick = (e: React.MouseEvent, n: RenderNode) => {
     e.stopPropagation();
     app.setSel({ kind: 'node', ids: [n.id] });
-    if (n.type === 'call') app.setPreviewNodeId(app.previewNodeId === n.id ? null : n.id);
-    else app.setPreviewNodeId(null);
   };
   const onNodeDblClick = (e: React.MouseEvent, n: RenderNode) => {
     e.stopPropagation();
@@ -297,13 +295,6 @@ export default function ScopeCanvas() {
       setRenaming({ id: n.id, x: n.x * view.k + view.x, y: n.y * view.k + view.y, w: n.w * view.k });
     }
   };
-
-  const previewNode = app.previewNodeId ? nodeMap.get(app.previewNodeId) : null;
-  const previewLayout: MiniLayout | null = useMemo(() => {
-    if (!previewNode || previewNode.type !== 'call') return null;
-    const target = app.project.processes.find((p) => p.id === (previewNode as unknown as CallNode).targetProcessId);
-    return target ? layoutMini(target) : null;
-  }, [previewNode, app.project]);
 
   return (
     <div ref={wrapRef} className="relative flex-1 min-w-0 overflow-hidden" style={{ background: th.canvas }}>
@@ -339,7 +330,6 @@ export default function ScopeCanvas() {
                 <NodeView key={n.id} n={n} theme={theme} editable={editable}
                   selected={sel.kind === 'node' && sel.ids.includes(n.id)}
                   hovered={hoverNode === n.id}
-                  previewOpen={app.previewNodeId === n.id}
                   onHover={(h) => setHoverNode(h ? n.id : null)}
                   onDown={(e) => startMove(e, n.id)}
                   onClick={(e) => onNodeClick(e, n)}
@@ -379,13 +369,6 @@ export default function ScopeCanvas() {
         <button className="zoom-btn" onClick={fitView} aria-label="适应视图" title="适应视图 (F)">⤢</button>
       </div>
 
-      {/* mini 预览浮层 */}
-      {previewNode && previewLayout && (
-        <MiniPreview n={previewNode} layout={previewLayout} theme={theme}
-          onClose={() => app.setPreviewNodeId(null)}
-          onEnter={() => { app.setPreviewNodeId(null); app.enterScope((previewNode as unknown as CallNode).targetProcessId); }} />
-      )}
-
       {/* 内联重命名 */}
       {renaming && (() => {
         const n = nodeMap.get(renaming.id); if (!n) return null;
@@ -419,8 +402,8 @@ function GridBg({ theme }: { theme: ThemeMode }) {
 }
 
 /* ---------------- 节点 ---------------- */
-function NodeView({ n, theme, selected, hovered, previewOpen, editable, onHover, onDown, onClick, onDblClick, onStartConnect }: {
-  n: RenderNode; theme: ThemeMode; selected: boolean; hovered: boolean; previewOpen: boolean; editable: boolean;
+function NodeView({ n, theme, selected, hovered, editable, onHover, onDown, onClick, onDblClick, onStartConnect }: {
+  n: RenderNode; theme: ThemeMode; selected: boolean; hovered: boolean; editable: boolean;
   onHover: (h: boolean) => void; onDown: (e: React.PointerEvent) => void;
   onClick: (e: React.MouseEvent) => void; onDblClick: (e: React.MouseEvent) => void;
   onStartConnect: (e: React.PointerEvent, h: Handle) => void;
@@ -471,7 +454,6 @@ function NodeView({ n, theme, selected, hovered, previewOpen, editable, onHover,
             onPointerDown={(e) => onStartConnect(e, h)} />
         );
       })}
-      {previewOpen && <rect x={n.x - 3} y={n.y - 3} width={n.w + 6} height={n.h + 6} rx={12} fill="none" stroke={th.sel} strokeWidth={1.5} strokeDasharray="4 3" />}
     </g>
   );
 }
@@ -527,50 +509,6 @@ function Breadcrumbs() {
           </button>
         </span>
       ))}
-    </div>
-  );
-}
-
-/* ---------------- mini 预览浮层 ---------------- */
-function MiniPreview({ n, layout, theme, onClose, onEnter }: {
-  n: RenderNode; layout: MiniLayout; theme: ThemeMode; onClose: () => void; onEnter: () => void;
-}) {
-  const th = THEME[theme];
-  const target = (n as CallNode).targetProcessId;
-  const W = Math.min(420, layout.width), H = Math.min(300, layout.height);
-  return (
-    <div className="absolute rounded-xl overflow-hidden z-20"
-      style={{
-        left: n.x, top: n.y, width: W + 2, maxHeight: 340,
-        background: 'var(--panel)', border: `1.5px solid ${th.sel}`, boxShadow: '0 8px 28px rgba(0,0,0,.28)',
-      }}>
-      <div className="flex items-center justify-between px-3 py-1.5" style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)' }}>
-        <span className="text-[11.5px] font-bold truncate" style={{ color: 'var(--text)' }}>{n.name}</span>
-        <button onClick={onClose} className="text-[13px] leading-none px-1" style={{ color: 'var(--muted)' }} aria-label="关闭预览">✕</button>
-      </div>
-      <svg width={W} height={Math.min(280, layout.height)} className="block">
-        {layout.edges.map((e, i) => (
-          <g key={i}>
-            <line x1={e.x1} y1={e.y1} x2={e.x2} y2={e.y2} stroke={th.edge} strokeWidth={1.2} />
-            <polygon points={arrowPts(e.x2, e.y2, Math.atan2(e.y2 - e.y1, e.x2 - e.x1), 7)} fill={th.edge} />
-          </g>
-        ))}
-        {layout.nodes.map((mn) => {
-          const key = (NODE_DEFAULTS[mn.type]?.color ?? 'indigo') as keyof typeof SHAPE_COLORS;
-          const { fill, stroke } = SHAPE_COLORS[key][theme];
-          return (
-            <g key={mn.id}>
-              <rect x={mn.x} y={mn.y} width={mn.w} height={mn.h} rx={7} fill={fill} stroke={stroke} strokeWidth={1.2} />
-              <text x={mn.x + mn.w / 2} y={mn.y + mn.h / 2 + 1} textAnchor="middle" dominantBaseline="middle"
-                fontSize={10} fontWeight={600} fill={readableOn(fill)} fontFamily={FONT_STACK}>{mn.name}</text>
-            </g>
-          );
-        })}
-      </svg>
-      <button onClick={onEnter} className="w-full py-1.5 text-[11.5px] font-bold transition-colors hover:opacity-90"
-        style={{ background: th.sel, color: '#fff' }}>
-        进入此子流程 →
-      </button>
     </div>
   );
 }
